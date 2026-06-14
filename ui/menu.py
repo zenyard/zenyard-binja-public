@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from binaryninjaui import UIActionContext, UIAction, UIActionHandler, Menu  # type: ignore[import]
-from binaryninja.interaction import show_message_box  # type: ignore[import]
 
 from .settings_dialog import show_settings_dialog
 
-SETTING_ACTION = "Zenyard:Settings"
+SETTING_ACTION = "Zenyard Settings"
+CREATE_REVISION_ACTION = "CreateRevision"
+CHECK_INFERENCES_ACTION = "CheckInferences"
 
 _menu_registered: bool = False
+
+_menu_registered: bool = False
+
 
 def register_menu() -> None:
     global _menu_registered
