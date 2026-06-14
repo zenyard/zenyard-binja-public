@@ -1,0 +1,109 @@
+# Installing the Zenyard plugin for Binary Ninja
+
+Zenyard is distributed through an **unofficial 3rd-party plugin repository**.
+Installing it is a two-part process: first register Zenyard's repository in
+Binary Ninja's settings, then install and set up the plugin from the Plugin
+Manager.
+
+> Screenshots are from Binary Ninja 5.3.x on macOS. Menu names are identical on
+> Windows and Linux; only the keyboard shortcut differs (`Ctrl` instead of `⌘`).
+
+## Part 1 — Register the Zenyard plugin repository
+
+### 1. Open Settings
+
+Open the command palette with **⌘P** (macOS) or **Ctrl+P** (Windows/Linux),
+type `settings`, and select **Settings**.
+
+![Open the command palette and select Settings](docs/images/1.png)
+
+### 2. Search for "Unofficial"
+
+In the Settings search bar at the top, type **`Unofficial`**. Binary Ninja
+filters to the **Plugin Manager** group, which shows two settings:
+
+- **Unofficial 3rd Party Plugin Repository Display Name**
+- **Unofficial 3rd Party Plugin Repository URL**
+
+![Search the settings for "Unofficial"](docs/images/2.png)
+
+### 3. Enter the repository name and URL
+
+Fill in the two fields exactly as below:
+
+| Setting        | Value                                                                          |
+| -------------- | ------------------------------------------------------------------------------ |
+| Display Name   | `Zenyard`                                                                      |
+| Repository URL | `https://raw.githubusercontent.com/zenyard/zenyard-binja-plugins-repo/refs/heads/main/` |
+
+![Enter the display name and repository URL](docs/images/3.png)
+
+When both fields show **(Modified in User)**, the Zenyard repository is
+registered.
+
+> **Note:** Enter the directory URL exactly as shown, including the trailing
+> slash. Binary Ninja appends `plugins.json` to it automatically — do **not**
+> add `plugins.json` yourself.
+
+> ### ♻️ Restart Binary Ninja before continuing
+>
+> The newly added repository is only fetched on startup. Quit and reopen Binary
+> Ninja so the Zenyard plugin appears in the Plugin Manager.
+
+## Part 2 — Install and set up the plugin
+
+### 4. Open the Plugin Manager
+
+From the menu bar, choose **Plugins → Manage Plugins** (or press **⌘⇧M** on
+macOS / **Ctrl+Shift+M** on Windows/Linux).
+
+![Open Plugins → Manage Plugins](docs/images/4.png)
+
+### 5. Find and install Zenyard
+
+In the Manage Plugins tab:
+
+1. Type **`Zenyard`** in the search box.
+2. Select the **Zenyard** plugin from the list to view its details.
+3. Click **Install**.
+
+![Search for Zenyard and click Install](docs/images/5.png)
+
+### 6. Install the Python dependencies
+
+Binary Ninja then lists the Python packages the plugin requires. Click **OK** to
+let it install them automatically.
+
+![Install the plugin's Python dependencies](docs/images/6.png)
+
+### 7. Start the setup wizard
+
+After Binary Ninja restarts, the **Zenyard Setup** wizard opens automatically and
+welcomes you. Click **Next**.
+
+![Zenyard Setup welcome screen](docs/images/7.png)
+
+### 8. Accept the Terms of Use
+
+Review the Terms of Use, tick **"I have read and accept the Terms of Use"**, then
+click **Next**.
+
+![Accept the Zenyard Terms of Use](docs/images/8.png)
+
+### 9. Connect to your Zenyard account
+
+Enter your Zenyard **API Key** (the **API URL** defaults to
+`https://api.zenyard.ai`). Click **Test Connection** to verify your
+credentials, then click **Finish**.
+
+![Enter the API URL and API key, then finish](docs/images/9.png)
+
+---
+> ### ♻️ Restart Binary Ninja again
+>
+> Quit and reopen Binary Ninja to load the plugin and its newly installed
+> dependencies.
+
+Zenyard is now installed and connected. You'll see the Zenyard status-bar widget
+in Binary Ninja, and the **Zenyard** menu becomes available for AI-powered
+analysis of your binaries.
