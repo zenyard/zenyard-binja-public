@@ -6,21 +6,6 @@ from .log import log_debug
 
 _HARDCODED_PREFIXES = ["libsystem_c", "libobjc"]
 
-_IGNORED_SEGMENTS = {
-    ".extern",
-    "extern",
-    ".plt",
-    "__plt",
-    ".plt.got",
-    ".plt.sec",
-    ".got",
-    "__got",
-    "__stubs",
-    "__objc_stubs",
-    "__auth_stubs",
-    # TODO: PE, Mach-O segments?
-}
-
 _SWIFT_SECTIONS = frozenset(
     {
         "__swift5_types",
@@ -100,7 +85,7 @@ class IgnoredSections:
                 return True
 
             data = _bare_section_name(section)
-            if data.section in _IGNORED_SECTIONS:
+            if data.section.startswith(tuple(_IGNORED_SECTIONS)):
                 return True
 
         return False
@@ -124,7 +109,7 @@ def loaded_image_names(bv: BinaryView) -> list[str] | None:
 
 
 def is_ignored_section(section: str) -> bool:
-    return section in _IGNORED_SEGMENTS
+    return section in _IGNORED_SECTIONS
 
 
 def is_swift_binary(bv: BinaryView) -> bool:

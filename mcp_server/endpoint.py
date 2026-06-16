@@ -67,6 +67,21 @@ class BinaryMcpEndpoint:
         self._relay: RelayProcess | None = None
         self._port: int | None = None
 
+    @property
+    def upstream_id(self) -> str:
+        """The per-binary relay routing id (the relay's ``serve --id``).
+
+        Deterministic from the file path, so it's available before the relay
+        starts; the backend addresses this binary via
+        ``<device_relay_id>:<upstream_id>``.
+        """
+        return _relay_id_for(self._bv)
+
+    @property
+    def relay_running(self) -> bool:
+        """True once the relay subprocess has been spawned for this binary."""
+        return self._relay is not None
+
     def start(self, *, binary_id: UUID | None) -> None:
         """Bring up the server and (if an API key is set) the relay.
 
@@ -125,7 +140,7 @@ class BinaryMcpEndpoint:
             tags["binary_id"] = str(binary_id)
         name = os.path.basename(self._bv.file.filename)
         proc = self._relay_factory(
-            relay_id=_relay_id_for(self._bv),
+            relay_id=self.upstream_id,
             mcp_url=self._server.url + "/mcp",
             display_name=name,
             description=f"Binary Ninja decompiler MCP for {name}",

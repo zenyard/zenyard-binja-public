@@ -388,18 +388,18 @@ class BringUpTask(CancellableTask):
         container = pathlib.Path(self._bv.file.filename).name
         ignored = IgnoredSections(container)
 
-        # A binary with no section table at all (e.g. section-header-stripped)
-        # makes "no section" true for every address — so absence of a section
-        # can't be a drop signal there, or we'd discard the whole upload.
-        sections_present = bool(self._bv.sections)
+        # in dsc view (apple shared cache file) we want to drop
+        # "Nameless" sections, in other file format, we keep them
+        # as they just might have been stripped.
+        keep_nameless_sections = 'DSCView' not in self._bv.view 
 
         # step 1: gather all symbols
         all_fns = {f.start for f in self._bv.functions}
         all_gls = {dv.address for dv in self._bv.data_vars.values()}
 
         # step 2: remove symbols in ignored / sectionless scaffolding regions
-        fn_addrs = self._keep_object_addrs(all_fns, ignored, sections_present)
-        gl_addrs = self._keep_object_addrs(all_gls, ignored, sections_present)
+        fn_addrs = self._keep_object_addrs(all_fns, ignored, keep_nameless_sections)
+        gl_addrs = self._keep_object_addrs(all_gls, ignored, keep_nameless_sections)
 
         # step 3: remove non-dirty (first upload treats everything as dirty)
         if not full:
@@ -420,24 +420,15 @@ class BringUpTask(CancellableTask):
         self,
         addrs: set[int],
         ignored: IgnoredSections,
-        sections_present: bool,
+        keep_nameless_sections: bool,
     ) -> set[int]:
-        """Keep only object addresses worth uploading.
-
-        - In a section: drop if that section (or its library) is blacklisted.
-        - Sectionless, binary has sections: drop — it's loader/cache
-          scaffolding (GOT, objc-opt, stub islands, cache metadata); a symbol
-          name is no signal here, real globals live in the image's own
-          data sections.
-        - Sectionless, binary has no section table: keep (no section info to
-          filter on).
-        """
+        """Keep only object addresses worth uploading."""
         kept: set[int] = set()
         for a in addrs:
             sec_names = [sec.name for sec in self._bv.get_sections_at(a)]
             if sec_names:
                 if not ignored.contains(sec_names):
                     kept.add(a)
-            elif not sections_present:
+            elif keep_nameless_sections:
                 kept.add(a)
         return kept

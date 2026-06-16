@@ -26,6 +26,46 @@ import zenyard_relay
 
 _RELAY_EXE = "zenyard-relay.exe" if sys.platform == "win32" else "zenyard-relay"
 
+_CREATE_NO_WINDOW = (
+    subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+)
+
+# This device's stable relay id, resolved lazily and cached for the session.
+_device_relay_id: str | None = None
+
+
+def get_device_relay_id() -> str | None:
+    """This device's stable relay id (``zenyard-relay relay-id``), cached.
+
+    Distinct from the per-binary upstream id passed to ``serve --id``: the
+    backend routes the agent to a specific binary via ``<relay_id>:<upstream>``.
+    Returns ``None`` if the relay binary is missing or the command fails; the
+    agent action is gated on a non-``None`` value, and a failed lookup is
+    retried on the next call (rare, user-triggered).
+    """
+    global _device_relay_id
+    if _device_relay_id is not None:
+        return _device_relay_id
+    try:
+        binary = zenyard_relay.binary_path()
+    except FileNotFoundError:
+        binary = None
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run(
+            [str(binary), "relay-id"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log_debug(f"failed to read device relay-id: {e}")
+        return None
+    _device_relay_id = result.stdout.strip() or None
+    return _device_relay_id
+
 
 class RelayBinaryNotFound(RuntimeError):
     """Raised when the ``zenyard-relay`` executable cannot be located."""
@@ -101,10 +141,6 @@ class RelayProcess:
         argv = self._build_argv(binary)
         log_info(
             f"starting zenyard-relay id={self._relay_id} url={self._mcp_url}"
-        )
-
-        _CREATE_NO_WINDOW = (
-            subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         )
 
         self._proc = subprocess.Popen(

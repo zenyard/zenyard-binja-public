@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (  # type: ignore[import]
     QWidget,
 )
 
-from .eula_text import EULA_TEXT, EULA_VERSION
+from zenyard_binja.ui.eula_text import EULA_TEXT, EULA_VERSION
 
 from ..configuration import (
     get_accepted_eula_version,

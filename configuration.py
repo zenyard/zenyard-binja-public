@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import typing as ty
+import uuid
 
 from pydantic import BaseModel, ConfigDict
 
@@ -47,6 +48,22 @@ def get_api_url() -> str:
 def get_api_key() -> str:
     cfg = _load_config()
     return cfg.get("apiKey", "")
+
+
+def get_or_create_install_id() -> str:
+    """Stable per-install id, generated once and persisted machine-globally.
+
+    Used as the ``token_id`` when minting a web login link for the Zenyard
+    Agent, so the backend can name (and later revoke) the link's token.
+    """
+    cfg = _load_config()
+    install_id = cfg.get("installId")
+    if isinstance(install_id, str) and install_id:
+        return install_id
+    install_id = str(uuid.uuid4())
+    cfg["installId"] = install_id
+    _save_config(cfg)
+    return install_id
 
 
 def get_accepted_eula_version() -> int:

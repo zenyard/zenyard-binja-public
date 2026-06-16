@@ -119,6 +119,16 @@ class Coordinator(BackgroundTaskThread):
     def first_revision_done(self) -> bool:
         return self._model.last_completed_revision > 0
 
+    def agent_upstream_id(self) -> str | None:
+        """Relay routing id for the Zenyard Agent, or None if the relay is down.
+
+        None whenever the MCP relay subprocess isn't running (no API key, or it
+        hasn't started yet) — the menu action is gated on a non-None value, the
+        same way the IDA plugin disables the action until its relay is up.
+        Safe to read from the Qt main thread (``relay_running`` is GIL-atomic).
+        """
+        return self._mcp.upstream_id if self._mcp.relay_running else None
+
     def progress_snapshot(self) -> RunSnapshot:
         """Lock-safe view of run state for the status-bar widget.
 
