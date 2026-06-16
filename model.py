@@ -30,7 +30,6 @@ class Model(BaseModel):
     sections_uploaded_revision: int = 0
     applied_count: int = 0
 
-    intro_dialog_suppressed: bool = False
     auto_apply: bool = True
 
     swift_inferences: dict[int, dict] = Field(default_factory=dict)
@@ -57,7 +56,6 @@ class Model(BaseModel):
         "applied_count": "zenyard.applied_count",
         "inference_cursor": "zenyard.inference_cursor",
         "sections_uploaded_revision": "zenyard.sections_revision",
-        "intro_dialog_suppressed": "zenyard.intro_dialog_suppressed",
         "auto_apply": "zenyard.auto_apply",
         "function_original_annotations": "zenyard.function_original_annotations",
         "swift_inferences": "zenyard.swift_inferences",

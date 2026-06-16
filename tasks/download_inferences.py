@@ -2,38 +2,48 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
+import traceback
+import typing as ty
 from dataclasses import dataclass
 
 from binaryninja.log import Logger
 
 from ..helpers.inference_types import InferenceItem
 from ..helpers.log import (
-    log_api_error,
     log_debug,
     log_error,
     log_info,
-    log_request_error,
+)
+from ..helpers.retry import (
+    Disposition,
+    RetryPolicy,
+    _GaveUp,
+    call_backend,
 )
 from ..model import Model
-from ..zenyard_client import ApiException, BinariesApi
+from ..zenyard_client import BinariesApi
 from ..zenyard_client.models import BinaryStateQueued, Inference
 
-from .base import LongLivedTask
+from .base import LongLivedTask, TaskCancelled
 
 _STATUS_POLL_INITIAL = 3.0
 _STATUS_POLL_MAX = 60.0
-_STATUS_ERROR_RETRIES = 10
-_STATUS_ERROR_SLEEP = 5.0
-_INFER_ERROR_RETRIES = 10
-_INFER_ERROR_SLEEP = 5.0
+_ERROR_BACKOFF_BASE = 2.0
+_ERROR_BACKOFF_MAX = 60.0
+
+
+# def _concise_error(e: Exception) -> str:
+#     if isinstance(e, ApiException):
+#         return f"HTTP {e.status} {e.reason}"
+#     flattened = " ".join(str(e).split())
+#     return f"{type(e).__name__}: {flattened}" if flattened else type(e).__name__
 
 
 @dataclass(frozen=True)
 class _Target:
     target_revision: int
     start_cursor: int | None
-    # When False, poll until the revision is analysed then stop (set
-    # ``analysis_ready``) without fetching/applying — the auto-apply-off path.
     apply: bool = True
 
 
@@ -53,10 +63,13 @@ class DownloadInferencesTask(LongLivedTask):
     Coordinator uses this during Create Revision to stop the stream so a new
     dirty-only bringup can run.
 
-    Errors on individual API calls retry up to ``_STATUS_ERROR_RETRIES`` /
-    ``_INFER_ERROR_RETRIES`` with a fixed sleep; on exhaustion the cycle gives
-    up and the Task returns to idle (the Coordinator can re-signal later via
-    ``set_target``).
+    Errors on individual API calls are classified (``helpers.retry.classify``):
+    transient ones (connection loss, timeouts, 5xx) are retried **forever**
+    with exponential backoff — an outage can never end the cycle, so the
+    stream resumes by itself when connectivity returns. Any other disposition
+    (auth, stale binary, bug) stops the cycle cleanly with a log; retrying
+    those cannot help. ``consecutive_failures`` exposes the current outage to
+    the status bar ("Reconnecting…").
     """
 
     def __init__(
@@ -67,11 +80,16 @@ class DownloadInferencesTask(LongLivedTask):
         channel: "queue.Queue[tuple[list[InferenceItem], int]]",
         stop: threading.Event,
         logger: Logger | None = None,
+        on_permanent_error: ty.Callable[[Disposition], None] | None = None,
     ) -> None:
         super().__init__("", stop=stop, logger=logger)
         self._api = api
         self._model = model
         self._channel = channel
+        # Notified (with the Disposition) when a cycle stops on a permanent,
+        # non-transient error so the Coordinator can disable/surface it
+        # (auth → dialog, stale → status). Wired via ``_cycle_policy``.
+        self._on_permanent_error = on_permanent_error
         self._drain = threading.Event()
         self._max_server_revision: int | None = None
         self.downloaded = 0
@@ -87,6 +105,10 @@ class DownloadInferencesTask(LongLivedTask):
         # queue (``BinaryStateQueued``); None once analysis runs. Read
         # GIL-atomically by the status bar, like ``server_revision``.
         self.queue_position: int | None = None
+        # Consecutive transient API failures in the current cycle; reset on
+        # every success. Read GIL-atomically by the status bar to surface
+        # "Reconnecting…" once an outage outlives a short grace.
+        self.consecutive_failures = 0
 
     # ── Public signal-in ──────────────────────────────────────────────────────
 
@@ -128,6 +150,7 @@ class DownloadInferencesTask(LongLivedTask):
         self.target_revision = target.target_revision
         self.server_revision = 0.0
         self.queue_position = None
+        self.consecutive_failures = 0
 
         self.waiting = True
         try:
@@ -170,13 +193,15 @@ class DownloadInferencesTask(LongLivedTask):
     # ── Polling ───────────────────────────────────────────────────────────────
 
     def _poll_until_ready(self, target_revision: int) -> bool:
-        """Block until ``server_revision >= target_revision`` or give up.
-        Returns True if ready, False on cancel/drain/exhausted retries."""
-        retries = 0
+        """Block until ``server_revision >= target_revision``.
+        Returns True if ready, False on cancel/drain or a non-transient
+        error. The status call runs through ``call_backend``, so transient
+        errors are retried forever with backoff — an outage can never make
+        this poll give up — while a drain/cancel or permanent disposition
+        ends it (``_GaveUp``)."""
         interval = _STATUS_POLL_INITIAL
         prev_progress: float | None = None
         prev_queue_position: int | None = None
-        max_rev: int | None = None
         binary_id = self._model.binary_id
         assert binary_id is not None
 
@@ -184,29 +209,13 @@ class DownloadInferencesTask(LongLivedTask):
             self.check_cancelled()
             if self._drain.is_set():
                 return False
-            try:
-                status = self._api.get_detailed_status(str(binary_id))
-                retries = 0
-            except ApiException as e:
-                log_api_error("GET /detailed_status failed", e)
-                retries += 1
-                if retries >= _STATUS_ERROR_RETRIES:
-                    log_error(
-                        "GET /detailed_status failed too many times; giving up"
-                    )
-                    return False
-                self.sleep_or_cancel(_STATUS_ERROR_SLEEP)
-                continue
-            except Exception as e:
-                log_request_error("GET /detailed_status request failed", e)
-                retries += 1
-                if retries >= _STATUS_ERROR_RETRIES:
-                    log_error(
-                        "GET /detailed_status request failed too many times; giving up"
-                    )
-                    return False
-                self.sleep_or_cancel(_STATUS_ERROR_SLEEP)
-                continue
+            status = call_backend(
+                "GET /detailed_status",
+                lambda: self._api.get_detailed_status(str(binary_id)),
+                self._cycle_policy(),
+            )
+            if isinstance(status, _GaveUp):
+                return False
 
             state_inst = status.state.actual_instance
             queue_position = (
@@ -216,19 +225,9 @@ class DownloadInferencesTask(LongLivedTask):
             )
             self.queue_position = queue_position
 
-            if status.revision_analyses:
-                max_rev = max(r.revision for r in status.revision_analyses)
-                self._max_server_revision = max(
-                    max_rev, self._max_server_revision or 0
-                )
-                missing = sum(
-                    1.0 - r.progress for r in status.revision_analyses
-                )
-                server_revision: float = self._max_server_revision - missing
-            else:
-                max_rev = None
-                server_revision = float(target_revision)
-
+            server_revision = self._server_revision_from(
+                status, target_revision
+            )
             self.server_revision = server_revision
 
             log_info(
@@ -248,7 +247,9 @@ class DownloadInferencesTask(LongLivedTask):
                 ),
                 None,
             )
-            if rev_status is not None and max_rev is not None:
+            # rev_status found ⇒ revision_analyses non-empty, so progress is
+            # real; otherwise fall back to a blind doubling backoff.
+            if rev_status is not None:
                 cur_progress = rev_status.progress
                 if cur_progress != prev_progress:
                     interval = _STATUS_POLL_INITIAL
@@ -265,7 +266,8 @@ class DownloadInferencesTask(LongLivedTask):
                 interval = _STATUS_POLL_INITIAL
             prev_queue_position = queue_position
 
-            self.sleep_or_cancel(interval)
+            if not self._sleep_or_interrupt(interval):
+                return False
 
     # ── Fetching ──────────────────────────────────────────────────────────────
 
@@ -274,8 +276,9 @@ class DownloadInferencesTask(LongLivedTask):
     ) -> tuple[list[InferenceItem], int, bool] | None:
         """Fetch one page. Returns ``(items, next_cursor, done)`` where
         ``next_cursor`` is the fresh server cursor and ``done`` is True iff
-        this is the terminal page. Returns None on cancel/drain/give-up."""
-        retries = 0
+        this is the terminal page. Returns None on cancel/drain or a
+        non-transient error (``_GaveUp`` from ``call_backend``); transient
+        errors are retried forever."""
         binary_id = self._model.binary_id
         assert binary_id is not None
 
@@ -283,52 +286,59 @@ class DownloadInferencesTask(LongLivedTask):
             self.check_cancelled()
             if self._drain.is_set():
                 return None
-            try:
-                result = self._api.get_inferences(
+            result = call_backend(
+                "GET /inferences",
+                lambda: self._api.get_inferences(
                     target_revision,
                     str(binary_id),
                     cursor=cursor,
                     limit=50,
-                )
-                retries = 0
-            except ApiException as e:
-                log_api_error("GET /inferences failed", e)
-                retries += 1
-                if retries >= _INFER_ERROR_RETRIES:
-                    log_error(
-                        "GET /inferences failed too many times; giving up"
-                    )
-                    return None
-                self.sleep_or_cancel(_INFER_ERROR_SLEEP)
-                continue
-            except Exception as e:
-                log_request_error("GET /inferences request failed", e)
-                retries += 1
-                if retries >= _INFER_ERROR_RETRIES:
-                    log_error(
-                        "GET /inferences request failed too many times; giving up"
-                    )
-                    return None
-                self.sleep_or_cancel(_INFER_ERROR_SLEEP)
-                continue
+                ),
+                self._cycle_policy(),
+            )
+            if isinstance(result, _GaveUp):
+                return None
 
-            concrete: list[InferenceItem] = [
-                item.actual_instance.actual_instance  # type: ignore[misc]
-                for item in result.inferences
-                if isinstance(item.actual_instance, Inference)
-                and item.actual_instance.actual_instance is not None
-            ]
+            concrete: list[InferenceItem] = []
+            for item in result.inferences:
+                try:
+                    inference = item.actual_instance
+                    if (
+                        isinstance(inference, Inference)
+                        and inference.actual_instance is not None
+                    ):
+                        concrete.append(inference.actual_instance)  # type: ignore[arg-type]
+                except Exception as e:
+                    # Poison isolation: one malformed inference must not
+                    # stall the whole stream — drop it and keep going (the
+                    # page cursor advances past it regardless).
+                    log_error(f"dropping malformed inference: {e!r}")
 
             if result.has_next:
                 if not concrete:
-                    self.sleep_or_cancel(_STATUS_POLL_INITIAL)
+                    # Pure pacing — a drain still forwards the page (the
+                    # cursor must travel); the put below drops it if drained.
+                    self._sleep_or_interrupt(_STATUS_POLL_INITIAL)
                 log_info(
                     f"fetched {len(concrete)} inference(s),"
                     f" cursor {cursor} → {result.cursor}, has_next=True"
                 )
                 return concrete, result.cursor, False
 
-            server_revision = self._compute_server_revision(target_revision)
+            # Terminal page — confirm the server really reached the target
+            # before calling the cycle done. The status check is its own
+            # ``call_backend``: a transient blip retries the (idempotent)
+            # status check, never fabricates "done"; a permanent/drain stops it.
+            status = call_backend(
+                "GET /detailed_status",
+                lambda: self._api.get_detailed_status(str(binary_id)),
+                self._cycle_policy(),
+            )
+            if isinstance(status, _GaveUp):
+                return None
+            server_revision = self._server_revision_from(
+                status, target_revision
+            )
             log_info(
                 f"fetched {len(concrete)} inference(s),"
                 f" cursor {cursor} → {result.cursor}, has_next=False,"
@@ -341,23 +351,60 @@ class DownloadInferencesTask(LongLivedTask):
                 f"server_revision {server_revision:.3f} < {target_revision},"
                 f" retrying after sleep"
             )
-            self.sleep_or_cancel(_STATUS_POLL_INITIAL)
+            if not self._sleep_or_interrupt(_STATUS_POLL_INITIAL):
+                return None
 
-    def _compute_server_revision(self, target_revision: int) -> float:
-        binary_id = self._model.binary_id
-        assert binary_id is not None
-        try:
-            status = self._api.get_detailed_status(str(binary_id))
-        except Exception:
-            return float(target_revision)
-        if status.revision_analyses:
-            max_rev = max(r.revision for r in status.revision_analyses)
+    def _server_revision_from(
+        self, status: object, target_revision: int
+    ) -> float:
+        analyses = status.revision_analyses  # type: ignore[attr-defined]
+        if analyses:
+            max_rev = max(r.revision for r in analyses)
             self._max_server_revision = max(
                 max_rev, self._max_server_revision or 0
             )
-            missing = sum(1.0 - r.progress for r in status.revision_analyses)
+            missing = sum(1.0 - r.progress for r in analyses)
             return self._max_server_revision - missing
         return float(target_revision)
+
+    def _on_error(self, exc: BaseException) -> None:
+        # An exception escaping the cycle body idles this task with nothing
+        # to re-arm it — make that loud (full traceback), not a one-line
+        # mystery in the log.
+        log_error(
+            "DownloadInferencesTask: unexpected error; cycle abandoned\n"
+            + "".join(traceback.format_exception(exc))
+        )
+
+    # ── Shared retry policy / sleep plumbing ──────────────────────────────────
+
+    def _cycle_policy(self) -> RetryPolicy:
+        """The cycle's per-call retry policy for ``call_backend``: transient
+        errors (connection loss, timeouts, 5xx) retry forever with backoff — an
+        outage can never end the cycle
+        """
+        return RetryPolicy(
+            max_retries=None,
+            base_delay=_ERROR_BACKOFF_BASE,
+            max_delay=_ERROR_BACKOFF_MAX,
+            stop=self._stop,
+            should_stop=lambda: self._drain.is_set() or self.is_cancelled(),
+            on_permanent=self._on_permanent_error,
+            on_failure_count=lambda n: setattr(self, "consecutive_failures", n),
+        )
+
+    def _sleep_or_interrupt(self, seconds: float) -> bool:
+        """Sleep ``seconds`` in ≤0.5 s slices, responsive to all three interrupts."""
+        deadline = time.monotonic() + seconds
+        while True:
+            self.check_cancelled()
+            if self._drain.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            if self._stop.wait(min(0.5, remaining)) or self.cancelled:
+                raise TaskCancelled()
 
     # ── Channel put with cooperative drain ────────────────────────────────────
 

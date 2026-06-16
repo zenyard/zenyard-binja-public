@@ -1,6 +1,5 @@
 import collections
 import zstandard
-from pathlib import Path
 from binaryninja import BinaryView, Section as BNSection
 from .log import log_debug
 
@@ -76,21 +75,20 @@ def _bare_section_name(name: str) -> SectionData:
     return SectionData(library, section, segment)
 
 
-def _norm_image(name: str) -> str:
-    """Compare images by basename so a blacklist install-path
-    matches the bare library prefix that Binary Ninja puts on
-    DSC section names (``libsystem_c.dylib``)."""
-    return Path(name).name
-
-
 class IgnoredSections:
     """
     Decides which object addresses to exclude from upload according
     to specific sectionsan loaded_image names
     """
 
-    def __init__(self, container_prefix: str) -> None:
-        self._ignored_prefixes = tuple(_HARDCODED_PREFIXES + [container_prefix])
+    def __init__(self, container_prefix: str = "") -> None:
+        # An empty container_prefix means "no cache container to drop"; never
+        # add it to the prefix tuple — ``str.startswith("")`` is always True
+        # and would match every section.
+        prefixes = list(_HARDCODED_PREFIXES)
+        if container_prefix:
+            prefixes.append(container_prefix)
+        self._ignored_prefixes = tuple(prefixes)
         log_debug(
             f"hardcoded images to ignore={self._ignored_prefixes} "
             f"sections={_IGNORED_SECTIONS}"

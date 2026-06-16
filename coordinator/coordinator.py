@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import queue
 import threading
+import typing as ty
 
 from binaryninja import (
     BackgroundTaskThread,
     BinaryView,
+    execute_on_main_thread,
     execute_on_main_thread_and_wait,
 )  # type: ignore[import]
 
@@ -24,11 +26,17 @@ from ..helpers.log import (
     log_request_error,
     log_warn,
 )
+from ..helpers.retry import (
+    Disposition,
+    RetryPolicy,
+    _GaveUp,
+    call_backend,
+)
 from ..helpers.sections import binary_mapped_size
 from ..mcp_server.endpoint import BinaryMcpEndpoint
 from ..mcp_server.ports import get_port_pool
 from ..model import Model
-from ..ui.dialogs import show_size_limit_exceeded
+from ..ui.dialogs import show_auth_error, show_size_limit_exceeded
 from ..zenyard_client import ApiClient, BinariesApi, UserApi
 from .classes import (
     UserAction,
@@ -46,21 +54,18 @@ from ..tasks.download_inferences import (  # noqa: E402
 _ShutdownSentinel: object = object()
 
 
-def _resolve_max_binary_size_mb(client: ApiClient) -> int:
-    """The user's max-binary-size limit, in MB.
-
-    Fetched from the server each session (the server owns trial/plan limits);
-    the last-known value is cached machine-globally in ``~/.binja/zenyard.json``
-    and used when the fetch fails, with a hardcoded default when nothing was
-    ever fetched.
-    """
-    try:
-        mb = UserApi(client).get_user_config().max_binary_size_mb
-        if mb is not None and mb > 0:
-            save_max_binary_size_mb(mb)
-            return mb
-    except Exception as e:
-        log_request_error("failed to fetch user config", e)
+def _resolve_max_binary_size_mb(
+    client: ApiClient,
+    on_permanent: ty.Callable[[Disposition], None],
+) -> int:
+    result = call_backend(
+        "GET user_config",
+        lambda: UserApi(client).get_user_config().max_binary_size_mb,
+        RetryPolicy(max_retries=3, on_permanent=on_permanent),
+    )
+    if not isinstance(result, _GaveUp) and result is not None and result > 0:
+        save_max_binary_size_mb(result)
+        return result
     return get_cached_max_binary_size_mb() or DEFAULT_MAX_BINARY_SIZE_MB
 
 
@@ -80,16 +85,13 @@ class Coordinator(BackgroundTaskThread):
     def __init__(self, bv: BinaryView) -> None:
         super().__init__("Zenyard", can_cancel=False)
         self._bv = bv
-        # One logger per open file, bound to this tab's BN session id, so its
-        # output lands in this tab's Log panel instead of the shared session 0.
-        # Threaded explicitly into the tasks, MCP endpoint, and relay below;
-        # leaf call sites resolve it from the contextvar bound at thread entry.
         self._logger = bv.create_logger("Zenyard")
         self._model = Model.create(bv)
         self._api: BinariesApi | None = None
         self._client: ApiClient | None = None
-        # Per-session verdict of the size gate — never persisted.
         self._size_blocked = False
+        self._auth_blocked = False
+        self._stale_binary = False
         self._stop = threading.Event()
         self._channel: queue.Queue[tuple[list[InferenceItem], int]] = (
             queue.Queue(maxsize=1)
@@ -136,8 +138,6 @@ class Coordinator(BackgroundTaskThread):
             download_working and dl is not None and dl.waiting
         )
         analysis_ready = bool(dl is not None and dl.analysis_ready)
-        # Exclude the ready flag so the brief window after a poll-only cycle
-        # drops ``waiting`` but before it returns can't read as "applying".
         download_active = bool(
             download_working and not download_waiting and not analysis_ready
         )
@@ -150,6 +150,13 @@ class Coordinator(BackgroundTaskThread):
         server_revision = dl.server_revision if dl is not None else 0.0
         target_revision = dl.target_revision if dl is not None else 0
         queue_position = dl.queue_position if dl is not None else None
+
+        if bring_up_active and bu is not None:
+            connection_failures = bu.connection_failures
+        elif dl is not None:
+            connection_failures = dl.consecutive_failures
+        else:
+            connection_failures = 0
 
         m = self._model
         with m._lock:
@@ -174,6 +181,9 @@ class Coordinator(BackgroundTaskThread):
             server_revision=server_revision,
             target_revision=target_revision,
             queue_position=queue_position,
+            connection_failures=connection_failures,
+            auth_blocked=self._auth_blocked,
+            stale_binary=self._stale_binary,
             objects_uploaded=bu.objects_uploaded if bu is not None else 0,
             objects_total=bu.objects_total if bu is not None else 0,
             downloaded=downloaded,
@@ -191,8 +201,6 @@ class Coordinator(BackgroundTaskThread):
         )
 
     def request_shutdown(self) -> None:
-        # _stop set first so a BringUpTask blocked in the initial _run_bring_up
-        # join can see is_cancelled() flip; the sentinel kicks the action loop.
         self._stop.set()
         self._actions.put(_ShutdownSentinel)
         log_debug(f"request shutdown {self._bv._file.filename}")
@@ -205,17 +213,10 @@ class Coordinator(BackgroundTaskThread):
             return
         self._client = make_client()
         self._api = BinariesApi(self._client)
-        # Size gate before bring-up: an over-limit Binary must see the
-        # "Binary Size Exceeded" notice before any intro prompt, registration
-        # or upload. While blocked the coordinator stays alive hosting
-        # MCP + relay only — the same posture as an unregistered Binary.
         self._check_binary_size_allowed()
 
-        # `finally` guarantees teardown on every exit path now that the MCP
-        # server + relay start before (and outlive) bring-up.
         try:
-            # Start the MCP server + relay immediately, independent of
-            # binary_id, so they persist for the lifetime of the open file.
+            # Start the MCP server + relay immediately, independent of binary_id,
             try:
                 self._mcp.start(binary_id=self._model.binary_id)
             except Exception as e:
@@ -225,12 +226,10 @@ class Coordinator(BackgroundTaskThread):
                 self._run_bring_up()
             if self._stop.is_set():
                 return
-            # Registration may not have happened — the user can cancel the
-            # startup prompt, intending to load an image first and analyze
-            # later. Don't exit: stay in the action loop so a later "Create
-            # Revision" can register and bring up. The MCP server + relay stay
-            # available even while unregistered. Steady-state tasks start only
-            # once registered.
+            # Registration may not have happened
+            # Don't exit: stay in the action loop so a later "Create Revision"
+            # can register and bring up.
+            # The MCP server + relay stay available even while unregistered
             if not self._size_blocked and self._model.binary_id is not None:
                 self._mcp.set_binary_id(self._model.binary_id)
                 self._enter_steady_state()
@@ -248,23 +247,17 @@ class Coordinator(BackgroundTaskThread):
                     return
                 assert isinstance(action, UserAction)
                 self._handle_action(action)
+        except Exception as e:
+            # Per-action failures are isolated in `_handle_action`; this catches an unexpected escape from the run loop itself
+            log_request_error(
+                "Coordinator: unexpected error; tearing down session", e
+            )
         finally:
             self._do_shutdown()
 
     def _await_setup(self) -> bool:
-        """Block until the machine is onboarded (EULA accepted + API key set).
-
-        The first ``ensure_setup`` call shows the onboarding modal. If the user
-        cancels it we must *not* exit the thread: this coordinator stays in the
-        process registry, so a dead ``run`` thread would leave ``_actions``
-        undrained and the status-bar "Click to analyze with Zenyard" would post
-        ``create_revision`` into a queue nobody reads — the click does nothing.
-        Instead we stay alive in a minimal loop; any user action re-attempts
-        setup, re-showing the modal. The consumed action is intentionally
-        dropped: ``run`` then falls through to the cold-start ``_run_bring_up``,
-        which is exactly what that action would have triggered. Re-posting it
-        would instead run a redundant dirty-only bring-up once registered.
-
+        """
+        Block until the machine is onboarded (EULA accepted + API key set).
         Returns True once onboarded; False only on shutdown.
         """
         if ensure_setup():
@@ -289,7 +282,9 @@ class Coordinator(BackgroundTaskThread):
         Sets ``_size_blocked`` and shows the notice when over the limit.
         """
         assert self._client is not None
-        limit_mb = _resolve_max_binary_size_mb(self._client)
+        limit_mb = _resolve_max_binary_size_mb(
+            self._client, self._on_permanent_error
+        )
         size = binary_mapped_size(self._bv)
         if size > limit_mb * 2**20:
             log_warn(
@@ -304,6 +299,25 @@ class Coordinator(BackgroundTaskThread):
         self._size_blocked = False
         return True
 
+    def _on_permanent_error(self, disposition: Disposition) -> None:
+        if disposition is Disposition.AUTH:
+            if self._auth_blocked:
+                return
+            self._auth_blocked = True
+            log_warn(
+                "Coordinator: authentication failed (401/403); analysis"
+                " disabled until the API key is fixed"
+            )
+            execute_on_main_thread(show_auth_error)
+        elif disposition is Disposition.STALE_BINARY:
+            if self._stale_binary:
+                return
+            self._stale_binary = True
+            log_warn(
+                "Coordinator: binary not found server-side (404); re-run"
+                " analysis to register it again"
+            )
+
     def _enter_steady_state(self) -> None:
         """Register the change tracker and start the long-lived download/apply
         tasks. Idempotent: a no-op once started (guarded on ``_download``)."""
@@ -311,12 +325,6 @@ class Coordinator(BackgroundTaskThread):
             return
         assert self._api is not None
 
-        # Bring-up has already run in the caller (`run` on cold start,
-        # `_handle_create_revision` on late registration), which also guards
-        # `_stop` afterwards. Repeating it here gave every startup a redundant
-        # dirty-check pass ("no dirty objects to upload") and, worse, left
-        # `_current_bring_up` pointing at that zeroed second task so the status
-        # bar read 0/0 counts.
         if self._model.binary_id is not None:
             self._mcp.set_binary_id(self._model.binary_id)
             self._ensure_inference_pipeline_started()
@@ -364,15 +372,11 @@ class Coordinator(BackgroundTaskThread):
             channel=self._channel,
             stop=self._stop,
             logger=self._logger,
+            on_permanent_error=self._on_permanent_error,
         )
         self._download.start()
 
-        # Start polling whenever there's a completed revision. With auto-apply
-        # on we always poll (so a reopened binary resumes applying any unconsumed
-        # inferences). With auto-apply off we only poll when *this* session just
-        # uploaded objects — i.e. the initial analysis that produced this
-        # revision — so a reopened, already-applied binary doesn't show a false
-        # "ready". The apply step itself is gated on the per-binary setting.
+        # Start polling whenever there's a completed revision. With auto-apply on we always poll
         if self.first_revision_done():
             auto_apply = self._model.auto_apply
             just_uploaded = (
@@ -400,6 +404,7 @@ class Coordinator(BackgroundTaskThread):
             stop=self._stop,
             prompt_intro=prompt_intro,
             logger=self._logger,
+            on_permanent_error=self._on_permanent_error,
         )
         # Retain the reference after join so the status bar can keep reading
         # the final upload counts; only the active flag flips back off.
@@ -409,28 +414,36 @@ class Coordinator(BackgroundTaskThread):
         self._bring_up_active = False
 
     def _handle_action(self, action: UserAction) -> None:
-        if action.kind == "ensure_setup":
-            ensure_setup()
-        elif action.kind == "create_revision":
-            self._handle_create_revision()
-        elif action.kind == "check_inferences":
-            self._handle_check_inferences()
+        # One bad action must never tear down the coordinator: an unhandled
+        # exception here would escape both action loops (``run`` and
+        # ``_enter_steady_state``), hit ``run``'s ``finally`` and shut down the
+        # MCP server, relay, and steady-state tasks for the whole session. Log
+        # and continue instead — matching IDA/Ghidra, where a task failure is
+        # isolated and never kills the plugin. (``_stop``-driven control flow
+        # uses return, not exceptions, so this does not swallow shutdown.)
+        try:
+            if action.kind == "ensure_setup":
+                ensure_setup()
+            elif action.kind == "create_revision":
+                self._handle_create_revision()
+            elif action.kind == "check_inferences":
+                self._handle_check_inferences()
+        except Exception as e:
+            log_request_error(
+                f"Coordinator: action {action.kind!r} failed; continuing", e
+            )
 
     def _handle_create_revision(self) -> None:
-        # While size-blocked, every retry re-checks against a fresh fetch (a
-        # server-side limit raise unblocks live) and re-shows the notice
-        # instead of dead-clicking — same retry shape as _await_setup.
+        if self._auth_blocked:
+            execute_on_main_thread(show_auth_error)
+            return
         if self._size_blocked and not self._check_binary_size_allowed():
             return
 
-        # Not yet registered (e.g. the user cancelled the startup prompt): this
-        # is still an *initial* analysis, so re-run bring-up with the intro +
-        # instructions prompts. They keep reappearing on every manual retry
-        # until the first analysis actually registers (``binary_id`` set); the
-        # registered branch below never prompts. This branch must precede the
-        # asserts below, which assume the steady-state tasks exist.
         if self._model.binary_id is None:
-            self._run_bring_up()
+            # The Create-Revision click is itself the user's intent — don't
+            # re-show the intro prompt on this unregistered re-run.
+            self._run_bring_up(prompt_intro=False)
             if self._stop.is_set() or self._model.binary_id is None:
                 return
             self._mcp.set_binary_id(self._model.binary_id)
@@ -449,10 +462,8 @@ class Coordinator(BackgroundTaskThread):
         self._run_bring_up()
         if self._stop.is_set():
             return
-        # Always poll the server after an upload. When auto-apply is off the
-        # cycle polls until ready then stops (surfacing the "ready" state)
-        # instead of fetching+applying — the apply step is the only thing the
-        # per-binary setting gates.
+
+        # Always poll the server after an upload.
         auto_apply = self._model.auto_apply
         self._download.set_target(
             target_revision=self._model.last_completed_revision,
@@ -466,16 +477,14 @@ class Coordinator(BackgroundTaskThread):
             )
 
     def _handle_check_inferences(self) -> None:
-        # A stray "Check Inferences" while unregistered (no steady-state tasks)
-        # must not crash the run loop — bail before touching _download.
+        if self._auth_blocked:
+            execute_on_main_thread(show_auth_error)
+            return
+
         if self._model.binary_id is None or self._download is None:
             return
         m = self._model
-        # Manual "apply now". Drain any in-flight cycle (e.g. a poll-only cycle
-        # running because auto-apply is off — it only checks _drain, not the
-        # pending payload) before submitting an apply target. The download task
-        # polls until ready then fetches+applies; if analysis is not ready yet
-        # the status bar already reflects that via the "server" state.
+
         log_debug("check_inferences: draining download…")
         self._download.request_drain()
         self._download.wait_idle()
@@ -521,20 +530,6 @@ def get_coordinator_for_bv(bv: BinaryView) -> Coordinator | None:
 def on_bv_created(bv: BinaryView) -> None:
     if bv.view_type == "Raw":
         return
-    # One coordinator per file. The registry is keyed by filename because the
-    # UI resolves coordinators by the active view's filename, not by id(bv)
-    # (see get_coordinator_for_bv). A second non-Raw view of the same file must
-    # therefore reuse the existing coordinator, not overwrite it: overwriting
-    # orphans the first coordinator's already-started BackgroundTaskThread,
-    # which then never receives request_shutdown() (shutdown only reaches
-    # coordinators still in the dict), so its download poller keeps running and
-    # its MCP port is never returned to the pool. Claim the slot under the lock;
-    # only start the thread once we own it.
-    #
-    # TODO: closing one of several same-file views still tears down the shared
-    # coordinator. A complete fix reference-counts open views per filename and
-    # shuts down only on the last close — pending confirmation that
-    # on_bv_created / OnBeforeCloseFile fire in balanced pairs.
     filename = bv._file.filename
     with _coordinators_lock:
         if filename in _coordinators:

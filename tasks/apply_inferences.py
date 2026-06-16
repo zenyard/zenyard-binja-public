@@ -15,7 +15,10 @@ from ..helpers.inference_types import InferenceItem
 from ..helpers.log import log_error, use_logger
 from ..model import Model
 
-from .base import CancellableTask
+from .base import CancellableTask, TaskCancelled
+
+
+_LOOP_RECOVER_DELAY = 2.0
 
 
 class ApplyInferencesTask(CancellableTask):
@@ -75,12 +78,13 @@ class ApplyInferencesTask(CancellableTask):
 
     def _run(self) -> None:
         while not self.is_cancelled():
-            page = self._take_next_batch()
-            if page is None:
-                self.sleep_or_cancel(0.5)
-                continue
-            batch, cursor = page
+            page = None
             try:
+                page = self._take_next_batch()
+                if page is None:
+                    self.sleep_or_cancel(0.5)
+                    continue
+                batch, cursor = page
                 if batch:
                     count: list[int] = []
                     with self._change_tracker.paused():
@@ -108,12 +112,17 @@ class ApplyInferencesTask(CancellableTask):
                 # Only now is the page durably applied; an exception above
                 # leaves the cursor behind so the page replays next session.
                 self._model.inference_cursor = cursor
+            except TaskCancelled:
+                # Cancellation/shutdown still ends the consumer cleanly.
+                raise
             except Exception as e:
-                log_error(f"apply batch failed: {e}")
+                log_error(f"apply loop error; continuing: {e}")
+                self.sleep_or_cancel(_LOOP_RECOVER_DELAY)
             finally:
-                with self._idle_cv:
-                    self._in_batch = False
-                    self._idle_cv.notify_all()
+                if page is not None:
+                    with self._idle_cv:
+                        self._in_batch = False
+                        self._idle_cv.notify_all()
 
     def _take_next_batch(
         self,

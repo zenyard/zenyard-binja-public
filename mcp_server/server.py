@@ -91,6 +91,7 @@ class BinaryMcpServer:
             name=f"zenyard-{port}",
             stateless_http=True,
             json_response=True,
+            log_level="WARNING",
         )
         register_tools(self._mcp, bv)
         self._thread: threading.Thread | None = None

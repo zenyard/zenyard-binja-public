@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import io
+import threading
 import traceback
 import typing as ty
 from contextlib import redirect_stderr, redirect_stdout
@@ -9,8 +10,6 @@ from contextlib import redirect_stderr, redirect_stdout
 import binaryninja as bn  # type: ignore[import]
 
 from ._hints import CODE_EXEC
-
-from ..server import bn_write
 
 
 def register_scripting_tools(mcp: ty.Any, bv: ty.Any) -> None:
@@ -39,8 +38,14 @@ def register_scripting_tools(mcp: ty.Any, bv: ty.Any) -> None:
         traceback is in ``stderr``.
 
         The namespace is fresh on every call (nothing persists between
-        calls). Execution happens on Binary Ninja's main thread, so a long or
-        blocking snippet stalls the UI until it returns.
+        calls). The snippet runs on a dedicated background thread, mirroring
+        Binary Ninja's scripting console -- NOT the main thread. This is what
+        lets blocking calls such as ``bv.update_analysis_and_wait()`` actually
+        complete; on the main thread that wait never settles (so variable
+        retypes/renames and anything that reads back post-reanalysis state
+        would silently fail). Consequently BinaryView mutations here run off
+        the main thread; if a snippet needs the UI thread, marshal to it
+        explicitly with ``bn.execute_on_main_thread_and_wait``.
 
         Args:
             code: Python code to run.
@@ -64,7 +69,31 @@ def register_scripting_tools(mcp: ty.Any, bv: ty.Any) -> None:
                 "stderr": err.getvalue(),
             }
 
-        return bn_write(run)
+        # Run off Binary Ninja's main thread, the way the scripting console
+        # does: update_analysis_and_wait() blocks until analysis settles, which
+        # never happens when called on the main thread. A dedicated worker
+        # thread (joined here) keeps the synchronous tool contract while letting
+        # such calls complete.
+        box: list[dict[str, str]] = []
+
+        def worker() -> None:
+            try:
+                box.append(run())
+            except BaseException:  # noqa: BLE001 - never leave box empty
+                box.append(
+                    {
+                        "result": "",
+                        "stdout": "",
+                        "stderr": traceback.format_exc(),
+                    }
+                )
+
+        thread = threading.Thread(
+            target=worker, name="zenyard-py_eval", daemon=True
+        )
+        thread.start()
+        thread.join()
+        return box[0]
 
 
 def _console_namespace(bv: ty.Any) -> dict[str, ty.Any]:

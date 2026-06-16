@@ -87,6 +87,36 @@ def log_request_error(prefix: str, e: Exception) -> None:
     log_error(f"{prefix}: {e}\n{traceback.format_exc()}")
 
 
+def log_call_error(prefix: str, e: BaseException) -> None:
+    """Log a failed backend call with the formatter its type warrants.
+
+    An ``ApiException`` carries an HTTP status / body worth surfacing; anything
+    else is a transport (or transport-adjacent) error whose message + traceback
+    is what matters. The single home for the "pick the right log formatter"
+    choice that used to be copy-pasted at every API call site.
+    """
+    if isinstance(e, ApiException):
+        log_api_error(prefix, e)
+    elif isinstance(e, Exception):
+        log_request_error(prefix, e)
+    else:
+        log_error(f"{prefix}: {e!r}\n{traceback.format_exc()}")
+
+
+def concise_error(e: BaseException) -> str:
+    """A single-line description of an error for the retry log.
+
+    For an ``ApiException`` the status line is what matters; for a transport
+    error urllib3's message already carries the host and OS cause (DNS, reset,
+    timeout), so we keep it whole but flatten any newlines — an outage stays one
+    line per retry instead of a screenful of traceback.
+    """
+    if isinstance(e, ApiException):
+        return f"HTTP {e.status} {e.reason}"
+    flattened = " ".join(str(e).split())
+    return f"{type(e).__name__}: {flattened}" if flattened else type(e).__name__
+
+
 def _format_section_counts(counts: Counter[str]) -> str:
     """Render a section→count breakdown, highest first, capped for log size."""
     top = counts.most_common(_MAX_SECTION_COUNTS_LOGGED)

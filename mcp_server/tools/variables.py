@@ -212,7 +212,7 @@ def register_variables_tools(mcp: ty.Any, bv: ty.Any) -> None:
             except Exception as e:  # noqa: BLE001
                 raise ValueError(f"Invalid type '{var_type}': {str(e)}") from e
 
-            var = bn.Variable.from_identifier(bv.arch, 0, var_name)
+            var = bn.Variable.from_identifier(func, 0)
 
             try:
                 func.create_user_var(var, parsed_type, var_name)

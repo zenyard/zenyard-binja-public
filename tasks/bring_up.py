@@ -4,12 +4,21 @@ import os
 import hashlib
 import pathlib
 import threading
+import typing as ty
 from uuid import UUID
 from binaryninja import (
     BinaryView,
     execute_on_main_thread_and_wait,
 )
 from binaryninja.log import Logger
+from ..configuration import get_preferences, save_show_initial_upload_message
+from ..api_client import LARGE_UPLOAD_TIMEOUT
+from ..helpers.retry import (
+    Disposition,
+    RetryPolicy,
+    _GaveUp,
+    call_backend,
+)
 from ..model import Model
 from ..helpers.revision_api import submit_revision
 from ..helpers.sections import (
@@ -19,14 +28,12 @@ from ..helpers.sections import (
     is_swift_binary,
 )
 from ..helpers.log import (
-    log_api_error,
     log_debug,
     log_error,
     log_info,
-    log_request_error,
     log_warn,
 )
-from ..zenyard_client import ApiException, BinariesApi
+from ..zenyard_client import BinariesApi
 from ..zenyard_client.models import (
     BinaryDetails,
     FinishAndAnalyzeCurrentRevisionBody,
@@ -48,6 +55,11 @@ from ..ui.dialogs import (
 )
 
 
+# Backoff for transient upload errors (same curve as the download cycle).
+_UPLOAD_BACKOFF_BASE = 2.0
+_UPLOAD_BACKOFF_MAX = 60.0
+
+
 class BringUpTask(CancellableTask):
     """
     One-shot per request. Drives a BinaryView from cold (or dirty) to a
@@ -66,12 +78,19 @@ class BringUpTask(CancellableTask):
         stop: threading.Event,
         prompt_intro: bool = True,
         logger: Logger | None = None,
+        on_permanent_error: ty.Callable[[Disposition], None] | None = None,
     ) -> None:
-        super().__init__("", stop=stop, logger=logger)
+        # A real title: BN's task panel is the visible (and cancellable)
+        # surface while an upload retries through an outage.
+        super().__init__("Zenyard upload", stop=stop, logger=logger)
         self._bv = bv
         self._api = api
         self._model = model
         self._prompt_intro = prompt_intro
+        # Notified (with the Disposition) when an upload gives up on a
+        # permanent error so the Coordinator can disable/surface it — the
+        # cold-start counterpart to the download task's callback.
+        self._on_permanent_error = on_permanent_error
         self._instructions: str | None = None
         self.objects_total = 0
         self.objects_uploaded = 0
@@ -79,6 +98,10 @@ class BringUpTask(CancellableTask):
         # ZenyardProgressDialog's poll timer (atomic int access under the GIL).
         self.objects_extracted = 0
         self.objects_extract_total = 0
+        # Consecutive transient upload failures, read GIL-atomically by the
+        # status bar (Coordinator.progress_snapshot) to surface
+        # "Reconnecting…" during bring-up.
+        self.connection_failures = 0
 
     def _run(self) -> None:
         self._ensure_binary_id()
@@ -88,6 +111,17 @@ class BringUpTask(CancellableTask):
         self._ensure_sections_uploaded()
         self.check_cancelled()
         self._ensure_revision_uploaded()
+
+    def _upload_policy(self) -> RetryPolicy:
+        return RetryPolicy(
+            max_retries=None,
+            base_delay=_UPLOAD_BACKOFF_BASE,
+            max_delay=_UPLOAD_BACKOFF_MAX,
+            stop=self._stop,
+            should_stop=self.is_cancelled,
+            on_permanent=self._on_permanent_error,
+            on_failure_count=lambda n: setattr(self, "connection_failures", n),
+        )
 
     # ── Step 1: registration ──────────────────────────────────────────────────
 
@@ -150,15 +184,13 @@ class BringUpTask(CancellableTask):
         log_debug(
             f"POST /binaries name='{body.name}' sha256={sha.hexdigest()[:16]}…"
         )
-        try:
-            result = self._api.create_binary(post_binary_body=body)
-        except ApiException as e:
-            log_api_error(f"POST /binaries failed for '{body.name}'", e)
-            return
-        except Exception as e:
-            log_request_error(
-                f"POST /binaries request failed for '{body.name}'", e
-            )
+
+        result = call_backend(
+            f"POST /binaries ('{body.name}')",
+            lambda: self._api.create_binary(post_binary_body=body),
+            self._upload_policy(),
+        )
+        if isinstance(result, _GaveUp):
             return
         log_info(f"registered binary {result.binary_id}")
         self._model.binary_id = UUID(str(result.binary_id))
@@ -191,20 +223,30 @@ class BringUpTask(CancellableTask):
                 compressed = get_section_compressed(bv, binja_sec)
                 if not compressed:
                     continue
-                try:
+                # This phase runs outside the extraction progress dialog —
+                # the task-panel text is its only visible surface.
+                self.progress = f"Zenyard: uploading section {binja_sec.name}…"
+
+                def _upload_one(
+                    addr: str = addr,
+                    data: bytes = compressed,
+                ) -> None:
                     api.set_large_data_to_object(
-                        addr, str(binary_id), compressed_data=compressed
+                        addr,
+                        str(binary_id),
+                        compressed_data=data,
+                        # Section bytes can be MBs; see LARGE_UPLOAD_TIMEOUT.
+                        _request_timeout=LARGE_UPLOAD_TIMEOUT,
                     )
-                except ApiException as e:
-                    log_api_error(
-                        f"PUT set_large_data_to_object failed for {binja_sec.name}",
-                        e,
-                    )
-                    return False
-                except Exception as e:
-                    log_request_error(
-                        f"PUT request failed for {binja_sec.name}", e
-                    )
+
+                if isinstance(
+                    call_backend(
+                        f"PUT set_large_data_to_object ({binja_sec.name})",
+                        _upload_one,
+                        self._upload_policy(),
+                    ),
+                    _GaveUp,
+                ):
                     return False
             return True
 
@@ -219,8 +261,8 @@ class BringUpTask(CancellableTask):
                 swift_only=False,
             ),
             label="sections",
+            policy=self._upload_policy(),
             post_add=_upload_section_data,
-            stop=self._stop,
         )
         if not ok:
             return
@@ -318,7 +360,7 @@ class BringUpTask(CancellableTask):
             f"upload complete — {result.uploaded_count} objects across"
             f" {result.batches} revision(s)"
         )
-        if not self._model.intro_dialog_suppressed:
+        if get_preferences().show_initial_upload_message:
             # execute_on_main_thread_and_wait doesn't propagate return values,
             # so capture the "Don't show this again" choice via a container
             # (mirrors prompt_intro_message). Persist it per-binary when ticked.
@@ -327,7 +369,7 @@ class BringUpTask(CancellableTask):
                 lambda: suppressed.__setitem__(0, show_upload_complete())
             )
             if suppressed[0]:
-                self._model.intro_dialog_suppressed = True
+                save_show_initial_upload_message(False)
         self._model.last_completed_revision = result.revision
         self._model.last_submitted_revision = result.revision
 

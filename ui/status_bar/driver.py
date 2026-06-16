@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 
+from binaryninja import BinaryView  # type: ignore[import]
 from binaryninja import execute_on_main_thread  # type: ignore[import]
 from binaryninja.interaction import show_message_box  # type: ignore[import]
 from binaryninjaui import UIContext  # type: ignore[import]
@@ -80,7 +81,8 @@ class _StatusBarController:
         self._widget = ZenyardStatusWidget()
         self._widget.actionTriggered.connect(self._on_action)
         self._mounted = False
-        self._current_bv: object | None = None
+        # Last *successfully* resolved bv (sticky) used when zenyard popups are blocking UI
+        self._current_bv: BinaryView | None = None
         self._last_usage = UsageInfo()
 
         self._timer = QTimer()
@@ -117,7 +119,7 @@ class _StatusBarController:
 
     # ── Coordinator poll tick ───────────────────────────────────────────────
 
-    def _active_bv(self) -> object | None:
+    def _active_bv(self) -> BinaryView | None:
         ctx = UIContext.activeContext()
         if ctx is None:
             return None
@@ -130,8 +132,11 @@ class _StatusBarController:
         try:
             if not self._ensure_mounted():
                 return
-            bv = self._active_bv()
-            self._current_bv = bv
+            # Sticky last-resolved bv
+            resolved = self._active_bv()
+            if resolved is not None:
+                self._current_bv = resolved
+            bv = self._current_bv
             coord = get_coordinator_for_bv(bv) if bv is not None else None
             if coord is None:
                 self._widget.set_pause_reason(None)
@@ -151,14 +156,24 @@ class _StatusBarController:
     def _usage_loop(self) -> None:
         """Poll the usage endpoint off the main thread until stopped."""
 
+        poll_failing = False
         while not self._stop.is_set():
             info: UsageInfo | None = None
             if get_api_key():
                 try:
                     resp = UserApi(make_client()).get_user_plans_usage()
                     info = _map_usage(resp)
+                    if poll_failing:
+                        log_debug("usage poll recovered")
+                    poll_failing = False
                 except Exception as e:
-                    log_warn(f"usage poll failed: {e}")
+                    # During an outage this fires every period — warn once on
+                    # the ok→fail edge, then stay quiet until recovery.
+                    if poll_failing:
+                        log_debug(f"usage poll failed: {e}")
+                    else:
+                        log_warn(f"usage poll failed: {e}")
+                    poll_failing = True
             execute_on_main_thread(lambda i=info: self._apply(i))
             if self._stop.wait(POLL_USAGE_S):
                 break

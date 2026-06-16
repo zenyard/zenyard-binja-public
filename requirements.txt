@@ -8,4 +8,4 @@ mcp>=1.23.3
 websockets>=13.0
 hypercorn>=0.17.0
 httpx>=0.28.0
-zenyard-relay>=0.1.1
+zenyard-relay>=0.1.2

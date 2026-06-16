@@ -208,7 +208,7 @@ class RevisionUploader:
                 swift_only=None,
             ),
             label=label,
-            stop=self._task._stop,
+            policy=self._task._upload_policy(),
         )
         if not ok:
             return False

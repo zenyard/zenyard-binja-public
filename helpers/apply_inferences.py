@@ -106,7 +106,7 @@ def apply_inferences(
                 continue
             addr = getattr(inf, "address", "bv-level")
             log_debug(f"applying {type(inf).__name__} at {addr}")
-            with bv.undoable_transaction():
+            with bv.undoable_transaction():  # pyright: ignore[reportGeneralTypeIssues]
                 if spec.needs_model and model is not None:
                     spec.apply(bv, inf, model, fn_cache)
                 else:
@@ -148,7 +148,7 @@ def _apply_function_types_batch(
     params = list(func.type.parameters)
     return_type = func.return_type
     changed = False
-    with bv.undoable_transaction():
+    with bv.undoable_transaction():  # pyright: ignore[reportGeneralTypeIssues]
         for inf in inferences:
             annotation = normalize_open_arrays(inf.type_annotation)
             try:
@@ -304,6 +304,8 @@ def _apply_variables_mapping(
             continue
         new_name = mapping.get(var.name)
         if new_name is None:
+            continue
+        if var.type is None:
             continue
         try:
             func.create_user_var(var, var.type, new_name)

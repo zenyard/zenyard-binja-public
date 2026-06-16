@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import traceback
 from typing import Any
 from binaryninja import BackgroundTaskThread  # type: ignore[import]
 from binaryninja.log import Logger
@@ -35,9 +36,21 @@ class CancellableTask(BackgroundTaskThread):
             self._run()
         except TaskCancelled:
             pass
+        except Exception as e:
+            self._on_error(e)
 
     def _run(self) -> None:
         raise NotImplementedError
+
+    def _on_error(self, exc: BaseException) -> None:
+        # An unexpected (non-cancel) exception escaping ``_run`` would otherwise
+        # propagate uncaught out of BN's BackgroundTaskThread and vanish with no
+        # plugin-level log. Surface it loud (full traceback) on this task's
+        # session logger; the thread then exits cleanly, not silently.
+        log_error(
+            f"{type(self).__name__}: unexpected error; task ended\n"
+            + "".join(traceback.format_exception(exc))
+        )
 
     def request_cancel(self) -> None:
         """Ask this task to stop at its next ``check_cancelled`` boundary."""
@@ -129,9 +142,6 @@ class LongLivedTask(CancellableTask):
 
     def _do_work(self, payload: Any) -> None:
         raise NotImplementedError
-
-    def _on_error(self, exc: BaseException) -> None:
-        log_error(f"LongLivedTask {self.title!r} error: {exc}")
 
     # ── Loop ──────────────────────────────────────────────────────────────────
 

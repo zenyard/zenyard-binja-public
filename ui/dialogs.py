@@ -56,6 +56,14 @@ Thanks,
 [NAME]
 """
 
+_AUTH_ERROR_TITLE = "Zenyard Authentication Failed"
+_AUTH_ERROR_BODY = (
+    "Zenyard couldn't authenticate with the server — your API key is"
+    " missing, invalid, or expired. Analysis for this binary is disabled"
+    " until it's fixed.\n\nUpdate your API key in Zenyard settings, then"
+    " reopen the binary to retry."
+)
+
 _SIZE_LIMIT_TITLE = "Binary Size Exceeded"
 _SIZE_LIMIT_BODY = (
     "Oops, this binary is over the {limit} MB limit for the Zenyard free"
@@ -395,6 +403,20 @@ def show_size_limit_exceeded(max_size_mb: int) -> None:
             f"mailto:{_CONTACT_EMAIL}"
             f"?subject={quote(_CONTACT_SUBJECT)}&body={quote(_CONTACT_BODY)}"
         )
+
+
+def show_auth_error() -> None:
+    """One-shot notice shown when the server rejects our credentials (401/403).
+
+    Analysis is disabled for the binary until the key is fixed — the
+    Coordinator's auth-blocked posture, mirroring the IDA plugin's disabled
+    state. Must be called on the main thread.
+    """
+    ZenyardDialog(
+        _AUTH_ERROR_TITLE,
+        _AUTH_ERROR_BODY,
+        show_cancel=False,
+    ).exec()
 
 
 def show_upload_complete() -> bool:

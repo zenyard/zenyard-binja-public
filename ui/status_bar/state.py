@@ -19,6 +19,11 @@ user a discoverable way back into analysis without the Zenyard menu.
 ``queued`` is likewise a local addition: the server reports the binary as
 waiting for an analysis slot (``BinaryStateQueued``), so the label shows
 "In queue (N remaining)" instead of claiming analysis is running.
+
+``reconnecting`` is a local addition too: the run loop retries transient
+backend failures forever (it never gives up on an outage), and after a short
+grace this state says so — without it an outage mid-run is indistinguishable
+from a hang.
 """
 
 from __future__ import annotations
@@ -34,12 +39,20 @@ STATES = (
     "uploading",
     "queued",
     "server",
+    "reconnecting",
+    "auth_error",
+    "stale",
     "ready",
     "applying",
     "applied",
     "warning",
     "paused",
 )
+
+# Consecutive transient failures before an active run shows "Reconnecting…".
+# Two ≈ read-timeout + one backoff after a wake/disconnect — long enough to
+# swallow a single blip, short enough that an outage doesn't read as a hang.
+_RECONNECT_AFTER_FAILURES = 2
 
 # The long-running pipeline states that surface a progress read-out (as opposed
 # to instantaneous/terminal states like `changes`, `idle`). `server` is included
@@ -76,6 +89,18 @@ class RunSnapshot:
     # Server queue position while analysis hasn't started (None once running).
     # Drives the `queued` state.
     queue_position: int | None = None
+
+    # Consecutive transient backend failures in the active phase (bring-up or
+    # download). Drives the `reconnecting` state once past the grace.
+    connection_failures: int = 0
+
+    # Permanent-disposition postures (see helpers.retry.classify). The
+    # Coordinator latches these when a backend call fails with a non-transient
+    # disposition: ``auth_blocked`` on 401/403 (bad/expired key — analysis is
+    # disabled until fixed), ``stale_binary`` on 404 (binary gone server-side).
+    # Each drives its own resting state, ranked above the run states.
+    auth_blocked: bool = False
+    stale_binary: bool = False
 
     objects_uploaded: int = 0
     objects_total: int = 0
@@ -212,7 +237,21 @@ def derive_view_state(
     # ahead of the terminal `applied`/`idle` — they are newer than the last
     # applied result, and `changes` is not gated on registration (it fires on
     # any binary, first run or re-run, the moment objects are dirty).
-    if snap.bring_up_active:
+    # An outage outranks the run states it overlays: a frozen bar or stale
+    # queue position is exactly the looks-like-a-hang impression this kills.
+    if snap.auth_blocked:
+        # Bad/expired key: analysis is disabled until fixed. Ranks above the
+        # run/outage states — retrying can't help, so "Reconnecting…" would
+        # mislead. (See the Coordinator's auth-blocked posture.)
+        state = "auth_error"
+    elif snap.stale_binary:
+        # Binary gone server-side (404): the run can't proceed against it.
+        state = "stale"
+    elif snap.connection_failures >= _RECONNECT_AFTER_FAILURES and (
+        snap.bring_up_active or snap.download_active or snap.download_waiting
+    ):
+        state = "reconnecting"
+    elif snap.bring_up_active:
         state = "uploading"
     elif snap.download_active or snap.apply_active:
         state = "applying"
@@ -234,9 +273,10 @@ def derive_view_state(
     else:
         state = "idle"
 
-    # Quota/expired usage wins: freeze the run in `paused` (handoff §Pause).
+    # Quota/expired usage wins over the run states — but not over a hard
+    # disabled posture (bad key / stale binary), which the user must act on.
     pause_reason: str | None = None
-    if quota_blocks(usage):
+    if quota_blocks(usage) and state not in ("auth_error", "stale"):
         state = "paused"
         pause_reason = (
             "expired" if usage and usage.kind == "expired" else ("quota")
@@ -329,6 +369,24 @@ def tooltip_copy(
             head,
             f"{uploaded} objects uploaded. Waiting for inferences…",
         )
+    if state == "reconnecting":
+        return (
+            "Connection lost",
+            "Can't reach the Zenyard server. Retrying — the run resumes "
+            "automatically once the connection is back.",
+        )
+    if state == "auth_error":
+        return (
+            "Authentication failed",
+            "Zenyard couldn't authenticate — your API key is missing, "
+            "invalid, or expired. Analysis is paused until you update it.",
+        )
+    if state == "stale":
+        return (
+            "Binary not found",
+            "This binary no longer exists on the Zenyard server. Re-run "
+            "analysis to register it again.",
+        )
     if state == "ready":
         return (
             "Analysis ready",
@@ -387,6 +445,9 @@ STATE_LABEL: dict[str, tuple[str, str]] = {
     "uploading": ("Uploading objects", "normal"),
     "queued": ("In queue", "normal"),
     "server": ("Analyzing on server", "normal"),
+    "reconnecting": ("Reconnecting…", "amber"),
+    "auth_error": ("Auth error · check API key", "amber"),
+    "stale": ("Binary not found on server", "amber"),
     "ready": ("Analysis ready · click to apply", "accent"),
     "applying": ("Applying results", "normal"),
     "applied": ("Latest results applied", "normal"),
