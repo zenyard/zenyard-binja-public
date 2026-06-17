@@ -29,6 +29,7 @@ from binaryninja.log import Logger
 
 from ..configuration import get_api_key, get_api_url
 from ..helpers.log import log_debug, log_error, log_info, log_request_error
+from ..helpers.misc import canonical_db_name
 from ..relay import RelayBinaryNotFound, RelayProcess
 from .ports import PortAllocator
 from .server import BinaryMcpServer
@@ -37,10 +38,10 @@ from .server import BinaryMcpServer
 def _relay_id_for(bv: ty.Any) -> str:
     """Stable, immediately-available routing id derived from the file path.
 
-    Hashes the path string (not file contents), so it is cheap, deterministic
-    across reopens, and matches the relay's ``[A-Za-z0-9_-]+`` id constraint.
     """
-    digest = hashlib.sha256(bv.file.filename.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(
+        canonical_db_name(bv.file.filename).encode("utf-8")
+    ).hexdigest()
     return f"binja-{digest}"
 
 

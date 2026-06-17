@@ -21,6 +21,7 @@ from ..helpers.retry import (
 )
 from ..model import Model
 from ..helpers.revision_api import submit_revision
+from ..helpers.main_thread import run_on_main_thread
 from ..helpers.sections import (
     IgnoredSections,
     get_section_compressed,
@@ -80,27 +81,17 @@ class BringUpTask(CancellableTask):
         logger: Logger | None = None,
         on_permanent_error: ty.Callable[[Disposition], None] | None = None,
     ) -> None:
-        # A real title: BN's task panel is the visible (and cancellable)
-        # surface while an upload retries through an outage.
         super().__init__("Zenyard upload", stop=stop, logger=logger)
         self._bv = bv
         self._api = api
         self._model = model
         self._prompt_intro = prompt_intro
-        # Notified (with the Disposition) when an upload gives up on a
-        # permanent error so the Coordinator can disable/surface it — the
-        # cold-start counterpart to the download task's callback.
         self._on_permanent_error = on_permanent_error
         self._instructions: str | None = None
         self.objects_total = 0
         self.objects_uploaded = 0
-        # Live extraction progress, written by RevisionUploader and read by the
-        # ZenyardProgressDialog's poll timer (atomic int access under the GIL).
         self.objects_extracted = 0
         self.objects_extract_total = 0
-        # Consecutive transient upload failures, read GIL-atomically by the
-        # status bar (Coordinator.progress_snapshot) to surface
-        # "Reconnecting…" during bring-up.
         self.connection_failures = 0
 
     def _run(self) -> None:
@@ -133,30 +124,17 @@ class BringUpTask(CancellableTask):
 
         # Not registered yet — prompt the user, then POST /binaries.
         if self._prompt_intro:
-            # ``None`` means the user cancelled; a bool is the per-binary
-            # auto-apply choice. execute_on_main_thread_and_wait can't return
-            # a value, so capture it via a container (mirrors the instructions
-            # prompt below). Persist the choice on the model (BNDB-backed).
-            choice: list[bool | None] = [True]
-            execute_on_main_thread_and_wait(
-                lambda: choice.__setitem__(0, prompt_intro_message())
-            )
-            auto_apply = choice[0]
+            auto_apply = run_on_main_thread(prompt_intro_message)
             if auto_apply is None:
-                log_warn("user chose to CANCEL!")
+                log_warn("Not runnig analysis. user cancel!")
                 return
             self._model.auto_apply = auto_apply
-        # ``None`` means the user cancelled the instructions prompt; an empty
-        # string means they accepted without adding any. Only the former aborts.
-        instr_holder: list[str | None] = [None]
-        execute_on_main_thread_and_wait(
-            lambda: instr_holder.__setitem__(0, prompt_binary_instructions())
-        )
-        instructions = instr_holder[0]
-        if instructions is None:
-            log_warn("user chose to CANCEL!")
+
+        self._instructions = run_on_main_thread(prompt_binary_instructions)
+        if self._instructions is None:
+            log_warn("Not runnig analysis. user cancel!")
             return
-        self._instructions = instructions or None
+        
         self._do_register()
 
     def _do_register(self) -> None:
@@ -299,12 +277,9 @@ class BringUpTask(CancellableTask):
 
         # Pop the progress dialog while objects are extracted + uploaded. It
         # polls the live counters and its Cancel button calls request_cancel,
-        # which trips check_cancelled() in the extraction loop. Capture the
-        # reference synchronously via a container (execute_on_main_thread_and_wait
-        # can't return a value), then let extraction proceed on this thread.
-        dialog_holder: list[ZenyardProgressDialog | None] = [None]
-
-        def _open_dialog() -> None:
+        # which trips check_cancelled() in the extraction loop. Build it on the
+        # main thread, then let extraction proceed on this thread.
+        def _open_dialog() -> ZenyardProgressDialog:
             dlg = ZenyardProgressDialog(
                 get_progress=lambda: (
                     self.objects_extracted,
@@ -312,10 +287,10 @@ class BringUpTask(CancellableTask):
                 ),
                 on_cancel=self.request_cancel,
             )
-            dialog_holder[0] = dlg
             dlg.show()
+            return dlg
 
-        execute_on_main_thread_and_wait(_open_dialog)
+        dlg = run_on_main_thread(_open_dialog)
 
         try:
             result = RevisionUploader(
@@ -340,9 +315,7 @@ class BringUpTask(CancellableTask):
             # Tear the dialog down before any later modal (show_upload_complete):
             # an app-modal dialog left visible would block input to it. Blocking
             # close so teardown completes before the next dialog opens.
-            dlg = dialog_holder[0]
-            if dlg is not None:
-                execute_on_main_thread_and_wait(dlg.close)
+            execute_on_main_thread_and_wait(dlg.close)
 
         if result.failed:
             # Re-queue every planned object the backend never durably saw
@@ -361,14 +334,10 @@ class BringUpTask(CancellableTask):
             f" {result.batches} revision(s)"
         )
         if get_preferences().show_initial_upload_message:
-            # execute_on_main_thread_and_wait doesn't propagate return values,
-            # so capture the "Don't show this again" choice via a container
-            # (mirrors prompt_intro_message). Persist it per-binary when ticked.
-            suppressed: list[bool] = [False]
-            execute_on_main_thread_and_wait(
-                lambda: suppressed.__setitem__(0, show_upload_complete())
-            )
-            if suppressed[0]:
+            # The "Don't show this again" choice; persist it per-binary when
+            # ticked.
+            suppressed = run_on_main_thread(show_upload_complete)
+            if suppressed:
                 save_show_initial_upload_message(False)
         self._model.last_completed_revision = result.revision
         self._model.last_submitted_revision = result.revision
@@ -391,15 +360,19 @@ class BringUpTask(CancellableTask):
         # in dsc view (apple shared cache file) we want to drop
         # "Nameless" sections, in other file format, we keep them
         # as they just might have been stripped.
-        keep_nameless_sections = 'DSCView' not in self._bv.view 
+        keep_nameless_sections = "DSCView" not in self._bv.view
 
         # step 1: gather all symbols
         all_fns = {f.start for f in self._bv.functions}
         all_gls = {dv.address for dv in self._bv.data_vars.values()}
 
         # step 2: remove symbols in ignored / sectionless scaffolding regions
-        fn_addrs = self._keep_object_addrs(all_fns, ignored, keep_nameless_sections)
-        gl_addrs = self._keep_object_addrs(all_gls, ignored, keep_nameless_sections)
+        fn_addrs = self._keep_object_addrs(
+            all_fns, ignored, keep_nameless_sections
+        )
+        gl_addrs = self._keep_object_addrs(
+            all_gls, ignored, keep_nameless_sections
+        )
 
         # step 3: remove non-dirty (first upload treats everything as dirty)
         if not full:

@@ -6,16 +6,7 @@ from urllib3.util.retry import Retry
 from .configuration import get_api_key, get_api_url
 from .zenyard_client import ApiClient, Configuration
 
-# Default (connect, read) timeout injected into every backend call that does
-# not pass its own ``_request_timeout``. Without it a half-open socket (the
-# classic aftermath of machine sleep or a dropped network) blocks the calling
-# thread inside urllib3 forever — the request never raises, so no retry layer
-# above it can act.
 DEFAULT_REQUEST_TIMEOUT: tuple[float, float] = (5.0, 30.0)
-
-# Scalar timeout = urllib3 ``Timeout(total=...)``. Large request bodies need a
-# *total* budget: urllib3 has no write timeout, so with a (connect, read) pair
-# a multi-MB upload's send phase is bounded only by the connect element.
 LARGE_UPLOAD_TIMEOUT: float = 300.0
 
 
@@ -57,5 +48,5 @@ def make_client() -> ApiClient:
         config.ssl_ca_cert = "/etc/ssl/cert.pem"
 
     # disable transport-level error retries except redirect
-    config.retries = Retry(connect=0, read=0, status=0, other=0, redirect=3)
+    config.retries = Retry(connect=0, read=0, status=0, other=1, redirect=3)
     return TimeoutApiClient(configuration=config)

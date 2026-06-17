@@ -27,6 +27,7 @@ from ..helpers.log import (
     log_request_error,
     log_warn,
 )
+from ..helpers.misc import canonical_db_name, get_coordinator_name
 from ..helpers.retry import (
     Disposition,
     RetryPolicy,
@@ -71,18 +72,6 @@ def _resolve_max_binary_size_mb(
 
 
 class Coordinator(BackgroundTaskThread):
-    """
-    Per-BinaryView coordinator. Slim orchestrator over three Tasks:
-    ``BringUpTask`` (one-shot per request), ``DownloadInferencesTask``
-    (long-lived, signal-driven via ``set_target`` / ``request_drain``), and
-    ``ApplyInferencesTask`` (always-running consumer of the shared inference
-    channel).
-
-    Owns the Model, the bounded inference channel, the ChangeTracker, and
-    the API client. The action queue surfaces UserActions (and the shutdown
-    sentinel) to a simple control-flow run loop; the FSM is gone.
-    """
-
     def __init__(self, bv: BinaryView) -> None:
         super().__init__("Zenyard", can_cancel=False)
         self._bv = bv
@@ -121,23 +110,10 @@ class Coordinator(BackgroundTaskThread):
         return self._model.last_completed_revision > 0
 
     def agent_upstream_id(self) -> str | None:
-        """Relay routing id for the Zenyard Agent, or None if the relay is down.
-
-        None whenever the MCP relay subprocess isn't running (no API key, or it
-        hasn't started yet) — the menu action is gated on a non-None value, the
-        same way the IDA plugin disables the action until its relay is up.
-        Safe to read from the Qt main thread (``relay_running`` is GIL-atomic).
-        """
         return self._mcp.upstream_id if self._mcp.relay_running else None
 
     def progress_snapshot(self) -> RunSnapshot:
-        """Lock-safe view of run state for the status-bar widget.
-
-        Called from the Qt main thread (the status-bar driver). Reads the
-        background tasks' monotonic counters (GIL-atomic) and the model under
-        its lock, assembling a frozen value object — the single wiring seam.
-        Never hands out a live task object.
-        """
+        """Lock-safe view of run state for the status-bar widget."""
 
         bu = self._current_bring_up
         dl = self._download
@@ -428,13 +404,6 @@ class Coordinator(BackgroundTaskThread):
         self._bring_up_active = False
 
     def _handle_action(self, action: UserAction) -> None:
-        # One bad action must never tear down the coordinator: an unhandled
-        # exception here would escape both action loops (``run`` and
-        # ``_enter_steady_state``), hit ``run``'s ``finally`` and shut down the
-        # MCP server, relay, and steady-state tasks for the whole session. Log
-        # and continue instead — matching IDA/Ghidra, where a task failure is
-        # isolated and never kills the plugin. (``_stop``-driven control flow
-        # uses return, not exceptions, so this does not swallow shutdown.)
         try:
             if action.kind == "ensure_setup":
                 ensure_setup()
@@ -538,27 +507,28 @@ _coordinators_lock = threading.Lock()
 
 def get_coordinator_for_bv(bv: BinaryView) -> Coordinator | None:
     with _coordinators_lock:
-        return _coordinators.get(bv._file.filename)
+        return _coordinators.get(get_coordinator_name(bv))
 
 
 def on_bv_created(bv: BinaryView) -> None:
     if bv.view_type == "Raw":
         return
-    filename = bv._file.filename
+    name = get_coordinator_name(bv)
     with _coordinators_lock:
-        if filename in _coordinators:
+        if name in _coordinators:
             return
         coord = Coordinator(bv)
-        _coordinators[filename] = coord
+        _coordinators[name] = coord
     coord.start()
 
 
 def shutdown_coordinators_for_file(filename: str) -> None:
+    name = canonical_db_name(filename)
     to_shutdown: list[Coordinator] = []
     with _coordinators_lock:
-        for bv_id, coord in list(_coordinators.items()):
-            if coord._bv.file.filename == filename:
-                del _coordinators[bv_id]
-                to_shutdown.append(coord)
+        coord = _coordinators.get(name, None)
+        if coord is not None:
+            del _coordinators[name]
+            to_shutdown.append(coord)
     for coord in to_shutdown:
         coord.request_shutdown()

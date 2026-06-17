@@ -35,9 +35,7 @@ class Model(BaseModel):
     swift_inferences: dict[int, dict] = Field(default_factory=dict)
     not_swift_inferences: dict[int, dict] = Field(default_factory=dict)
 
-    # Addresses whose function/global received a visible inference (rename /
-    # comment / type). Persisted so the Symbols-sidebar overlay can tint them
-    # across sessions; see ``add_applied_addresses``.
+    # Addresses whose function/global received a visible inference
     applied_addresses: set[int] = Field(default_factory=set)
 
     dirty_functions: set[int] = Field(default_factory=set)

@@ -1,19 +1,23 @@
 """Native PySide6 status-bar widget for Binary Ninja — stock-widget rebuild.
 
-A deliberately boring projection of the design: a ``QHBoxLayout`` of four stock
-widgets, no ``paintEvent``, no popups, no context menu.
+A deliberately boring projection of the design: a ``QHBoxLayout`` of stock
+widgets, no popups, no context menu.
 
-    [QLabel logo] [QLabel label] [QProgressBar]  —stretch—  [QLabel usage]
+    [QLabel logo] [QLabel label] [_BounceBar]  —stretch—  [QLabel usage]
 
 Colours come from the host (Binary Ninja) palette — the widget sets almost no
 colour itself. The only overrides are the two semantic accents (amber for the
 warning label + a high usage read-out, red for usage at/over budget) and the
-``Highlight`` role for the actionable ``changes`` label. The only motion is the
-progress bar: it sweeps back and forth on a small ``QTimer`` while progress is
-unknown or still at 0%, then fills to the percentage once it climbs above 0
-(``paused`` is the exception — a frozen, disabled fill, never a sweep). We animate
-the sweep ourselves because Binary Ninja's Qt style renders an indeterminate
-(``setRange(0, 0)``) bar as a *static* full chunk — no built-in marquee to lean on.
+``Highlight`` role for the actionable ``changes`` label. The only motion — and
+the only hand-painted element — is the progress bar (``_BounceBar``): while
+progress is unknown or still at 0% a single segment bounces back and forth on a
+small ``QTimer``, then it fills to the percentage once it climbs above 0
+(``paused`` is the exception — a frozen, greyed fill, never a bounce). The bar is
+hand-painted because a travelling segment genuinely can't be done with a stock
+``QProgressBar`` (which only fills from one edge), and Binary Ninja's Qt style
+renders an indeterminate (``setRange(0, 0)``) bar as a *static* full chunk — no
+built-in marquee to lean on. One paint routine draws both looks (fill + bounce)
+so the bounce→fill hand-off the busy states make has no style seam.
 
 The host drives it through the same contract methods as before
 (``set_state`` / ``set_progress`` / ``set_counts`` / ``set_warning_count`` /
@@ -27,14 +31,20 @@ unit-testable; this module only wires those strings into widgets.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal  # type: ignore[import]
-from PySide6.QtGui import QPalette, QPixmap  # type: ignore[import]
+from PySide6.QtCore import (  # type: ignore[import]
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QPainter, QPalette, QPixmap  # type: ignore[import]
 from PySide6.QtWidgets import (  # type: ignore[import]
     QHBoxLayout,
     QLabel,
-    QProgressBar,
     QWidget,
 )
 
@@ -55,19 +65,23 @@ _AMBER = "#e0a93b"
 _CRIT = "#e2685f"
 
 # States that show the progress bar. The bar runs one unified behaviour: it
-# sweeps (a self-animated marquee — BN's Qt style won't animate setRange(0, 0)
-# for us) while progress is unknown or still at 0%, and fills determinately once
-# a percentage climbs above 0. `queued` carries no fraction, so it sweeps its
-# whole duration (its queue position rides the label instead — see
-# `state.state_label`); `uploading` / `server` sweep only at the very start,
-# then fill (`server`'s % also rides the label).
-# `paused` is the exception: a frozen, disabled (greyed) fill — never a sweep.
+# bounces (a hand-painted segment travelling wall-to-wall — BN's Qt style won't
+# animate setRange(0, 0) for us) while progress is unknown or still at 0%, and
+# fills determinately once a percentage climbs above 0. `queued` carries no
+# fraction, so it bounces its whole duration (its queue position rides the label
+# instead — see `state.state_label`); `uploading` / `server` bounce only at the
+# very start, then fill (`server`'s % also rides the label).
+# `paused` is the exception: a frozen, greyed fill — never a bounce.
 _BAR_STATES = frozenset({"uploading", "queued", "server", "paused"})
 
-# Busy-sweep cadence. The bar value ping-pongs 0→100→0; one full cycle is
-# 200 / _BUSY_ANIM_STEP ticks ≈ 1.3 s at this interval.
+# Busy-bounce cadence. `_busy_phase` walks 0.._BUSY_PERIOD; one full out-and-back
+# (0→1→0) is _BUSY_PERIOD / _BUSY_ANIM_STEP ticks ≈ 1.3 s at this interval.
 _BUSY_ANIM_MS = 33
 _BUSY_ANIM_STEP = 5
+_BUSY_PERIOD = 200
+
+# Width of the bouncing segment as a fraction of the track.
+_SEG_FRAC = 0.32
 
 
 def _scaled(name: str) -> QPixmap:
@@ -79,11 +93,77 @@ def _scaled(name: str) -> QPixmap:
     )
 
 
-def _busy_sweep(phase: int) -> int:
-    """Triangle wave over a 0..199 phase: rising 0→100, then falling 100→0.
-    Keeps the busy-bar sweep reversing smoothly instead of snapping back."""
+def _busy_pos(phase: int) -> float:
+    """Eased 0→1→0 segment position over a 0.._BUSY_PERIOD phase.
 
-    return phase if phase <= 100 else 200 - phase
+    A raised cosine: zero velocity at both walls (the segment eases to a stop
+    and reverses) and max speed mid-track — one full out-and-back per period."""
+
+    return 0.5 - 0.5 * math.cos(2 * math.pi * phase / _BUSY_PERIOD)
+
+
+class _BounceBar(QWidget):
+    """The status bar's progress bar, hand-painted (~84×6 px).
+
+    Two looks from one paint routine: a determinate *fill* (left edge → ``pct``)
+    or a *bounce* — a single fixed-width segment that travels wall-to-wall and
+    back. Both draw the same rounded accent chunk against the same muted track,
+    so the bounce→fill hand-off the busy states make (bounce at 0%, fill once %
+    climbs) has no style seam. Colours come from the palette: ``Highlight`` for
+    the chunk, a dimmed ``WindowText`` for the track; a paused bar uses the
+    disabled-group ``Highlight`` so it reads greyed."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(_BAR_W, _BAR_H)
+        self._bouncing = False
+        self._pos = 0.0  # eased segment position, 0..1 (bounce mode)
+        self._pct = 0  # fill fraction, 0..100 (determinate mode)
+        self._enabled_look = True  # False ⇒ paused/greyed chunk
+
+    def set_fill(self, pct: int, *, enabled: bool = True) -> None:
+        self._bouncing = False
+        self._pct = max(0, min(100, pct))
+        self._enabled_look = enabled
+        self.update()
+
+    def set_bounce_pos(self, pos: float) -> None:
+        self._bouncing = True
+        self._enabled_look = True
+        self._pos = pos
+        self.update()
+
+    def paintEvent(self, ev: object) -> None:  # noqa: N802 (Qt override)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+
+        w, h = float(self.width()), float(self.height())
+        r = h / 2
+
+        track = self.palette().color(
+            QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText
+        )
+        track.setAlpha(60)
+        p.setBrush(track)
+        p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
+
+        group = (
+            QPalette.ColorGroup.Normal
+            if self._enabled_look
+            else QPalette.ColorGroup.Disabled
+        )
+        if self._bouncing:
+            x = self._pos * (1.0 - _SEG_FRAC) * w
+            cw = _SEG_FRAC * w
+        else:
+            x = 0.0
+            cw = (self._pct / 100.0) * w
+        if cw > 0:
+            p.setBrush(
+                self.palette().color(group, QPalette.ColorRole.Highlight)
+            )
+            p.drawRoundedRect(QRectF(x, 0, cw, h), r, r)
 
 
 def _is_determinate(state: str, pct: int | None) -> bool:
@@ -120,12 +200,10 @@ class ZenyardStatusWidget(QWidget):
 
         self._label = QLabel("Zenyard")
 
-        self._bar = QProgressBar()
-        self._bar.setTextVisible(False)
-        self._bar.setFixedSize(_BAR_W, _BAR_H)
+        self._bar = _BounceBar()
         self._bar.hide()
 
-        # Drives the busy-state sweep (Binary Ninja's style won't animate an
+        # Drives the busy-state bounce (Binary Ninja's style won't animate an
         # indeterminate bar for us). Runs only while a busy state is showing.
         self._busy_phase = 0
         self._busy_timer = QTimer(self)
@@ -167,8 +245,8 @@ class ZenyardStatusWidget(QWidget):
                 st.state_label(state, self._pct, self._warning_count)[0]
             )
         if state in _BAR_STATES:
-            # Re-apply, not just setValue: crossing 0% flips the bar between its
-            # sweep and its determinate fill.
+            # Re-apply the whole bar: crossing 0% flips it between its bounce
+            # and its determinate fill, not just the fill value.
             self._apply_bar(state)
         self._update_tooltip()
 
@@ -280,25 +358,24 @@ class ZenyardStatusWidget(QWidget):
             self._busy_timer.stop()
             self._bar.hide()
             return
-        self._bar.setRange(0, 100)
         if _is_determinate(state, self._pct):
             self._busy_timer.stop()
-            self._bar.setValue(self._pct or 0)
-            # Paused renders the bar disabled → muted/greyed chunk.
-            self._bar.setEnabled(state != "paused")
+            # Paused is a frozen, greyed fill (drawn muted, not just disabled).
+            self._bar.set_fill(self._pct or 0, enabled=state != "paused")
         else:
-            # Self-animated sweep: a real range + a timer that ping-pongs the
-            # value, since the host style won't animate setRange(0, 0). The
-            # `isActive` guard keeps re-entry (every poll tick) from resetting
-            # `_busy_phase`.
-            self._bar.setEnabled(True)
+            # Self-animated bounce: a timer walks `_busy_phase` and the bar
+            # repaints a travelling segment, since the host style won't animate
+            # setRange(0, 0). Prime the segment now so bounce mode shows without
+            # a stale frame; the `isActive` guard keeps re-entry (every poll
+            # tick) from resetting `_busy_phase`.
+            self._bar.set_bounce_pos(_busy_pos(self._busy_phase))
             if not self._busy_timer.isActive():
                 self._busy_timer.start()
         self._bar.show()
 
     def _advance_busy(self) -> None:
-        self._busy_phase = (self._busy_phase + _BUSY_ANIM_STEP) % 200
-        self._bar.setValue(_busy_sweep(self._busy_phase))
+        self._busy_phase = (self._busy_phase + _BUSY_ANIM_STEP) % _BUSY_PERIOD
+        self._bar.set_bounce_pos(_busy_pos(self._busy_phase))
 
     def _apply_usage(self) -> None:
         text = st.usage_text(self._usage)

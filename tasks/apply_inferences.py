@@ -5,7 +5,6 @@ import threading
 
 from binaryninja import (  # type: ignore[import]
     BinaryView,
-    execute_on_main_thread_and_wait,
 )
 from binaryninja.log import Logger
 
@@ -13,6 +12,7 @@ from ..change_tracker import ChangeTracker
 from ..helpers.apply_inferences import apply_inferences
 from ..helpers.inference_types import InferenceItem
 from ..helpers.log import log_error, use_logger
+from ..helpers.main_thread import run_on_main_thread
 from ..model import Model
 
 from .base import CancellableTask, TaskCancelled
@@ -22,25 +22,6 @@ _LOOP_RECOVER_DELAY = 2.0
 
 
 class ApplyInferencesTask(CancellableTask):
-    """
-    Always-running consumer for the Coordinator's lifetime. Pulls inference
-    pages — ``(items, end_cursor)`` — from a shared queue and applies them on
-    the main thread, with ChangeTracker paused around each apply so the BV
-    writes aren't observed as user edits. ``model.inference_cursor`` is
-    persisted here, only after a page is applied: the cursor means "applied
-    up to here", so a shutdown mid-page replays it next session instead of
-    silently skipping it.
-
-    Started once at Coordinator start; only stops when ``cancel()`` is invoked
-    (during Coordinator shutdown). When the queue is empty the 0.5s tick
-    keeps the cancel/shutdown path responsive.
-
-    Exposes ``is_idle()`` / ``wait_idle()`` so the Coordinator can block on
-    the channel being drained during Create Revision. Channel observation
-    and the in-batch flag are read together under a Condition lock so the
-    "between get_nowait and in_batch=True" window cannot produce a false
-    idle: ``_take_next_batch`` performs both under the same lock.
-    """
 
     def __init__(
         self,
@@ -86,27 +67,23 @@ class ApplyInferencesTask(CancellableTask):
                     continue
                 batch, cursor = page
                 if batch:
-                    count: list[int] = []
                     with self._change_tracker.paused():
                         # apply_inferences runs on the main thread, whose
                         # context isn't bound to this session — scope the bind
                         # to the callback so its log lines route to this tab,
                         # then revert.
-                        def _apply() -> None:
+                        def _apply() -> int:
                             with use_logger(self._logger):
-                                count.append(
-                                    apply_inferences(
-                                        self._bv, batch, self._model
-                                    )
+                                return apply_inferences(
+                                    self._bv, batch, self._model
                                 )
 
-                        execute_on_main_thread_and_wait(_apply)
+                        applied = run_on_main_thread(_apply)
                         # Drain analysis here (BG thread) so notifications
                         # fired during the analysis pass still see paused ==
                         # True. BN forbids waiting from the UI thread, so it
-                        # can't happen inside the lambda above.
+                        # can't happen inside the callback above.
                         self._bv.update_analysis_and_wait()
-                    applied = count[0] if count else 0
                     self.applied += applied
                     self._model.add_applied(applied)
                 # Only now is the page durably applied; an exception above
