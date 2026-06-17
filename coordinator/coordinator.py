@@ -18,6 +18,7 @@ from ..configuration import (
     get_cached_max_binary_size_mb,
     save_max_binary_size_mb,
 )
+from ..helpers.analytics import track_file_open
 from ..helpers.inference_types import InferenceItem
 from ..helpers.log import (
     bind_logger,
@@ -223,6 +224,9 @@ class Coordinator(BackgroundTaskThread):
             return
         self._client = make_client()
         self._api = BinariesApi(self._client)
+        # Fire-and-forget "File - Open" analytics, once per opened binary. Runs
+        # before the size check so a size-blocked open is still reported.
+        track_file_open(self._bv)
         self._check_binary_size_allowed()
 
         try:

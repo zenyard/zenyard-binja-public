@@ -50,6 +50,17 @@ def get_api_key() -> str:
     return cfg.get("apiKey", "")
 
 
+def get_analytics_disabled() -> bool:
+    """Opt-out switch for analytics. Default: enabled (flag absent/false).
+
+    Mirrors the IDA plugin's ``disable_analytics`` gate. Set
+    ``"disableAnalytics": true`` in ``~/.binja/zenyard.json`` to suppress all
+    analytics sends.
+    """
+    cfg = _load_config()
+    return bool(cfg.get("disableAnalytics", False))
+
+
 def get_or_create_install_id() -> str:
     """Stable per-install id, generated once and persisted machine-globally.
 

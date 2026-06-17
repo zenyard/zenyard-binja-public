@@ -246,7 +246,7 @@ def _apply_overview(
         log_debug(f"no function at {inf.address} for FunctionOverview")
         return
 
-    func.set_comment_at(func.start, text)
+    func.comment = text
     log_debug(f"set function overview at {func.start}")
 
 
