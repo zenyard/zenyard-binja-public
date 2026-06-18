@@ -38,11 +38,6 @@ class Model(BaseModel):
     # Addresses whose function/global received a visible inference
     applied_addresses: set[int] = Field(default_factory=set)
 
-    dirty_functions: set[int] = Field(default_factory=set)
-    dirty_globals: set[int] = Field(default_factory=set)
-    removed_functions: set[int] = Field(default_factory=set)
-    removed_globals: set[int] = Field(default_factory=set)
-
     uploaded_hash: dict[int, bytes] = Field(default_factory=dict)
 
     _initialized: bool = PrivateAttr(default=False)
@@ -97,26 +92,6 @@ class Model(BaseModel):
                 return
             self.bv.store_metadata(key, self._serialize(name, value))
 
-    def mark_function_dirty(self, addr: int) -> None:
-        with self._lock:
-            self.dirty_functions.add(addr)
-            self.removed_functions.discard(addr)
-
-    def mark_function_removed(self, addr: int) -> None:
-        with self._lock:
-            self.dirty_functions.discard(addr)
-            self.removed_functions.add(addr)
-
-    def mark_global_dirty(self, addr: int) -> None:
-        with self._lock:
-            self.dirty_globals.add(addr)
-            self.removed_globals.discard(addr)
-
-    def mark_global_removed(self, addr: int) -> None:
-        with self._lock:
-            self.dirty_globals.discard(addr)
-            self.removed_globals.add(addr)
-
     def add_applied(self, n: int) -> None:
         """Increment the cumulative applied-inference counter (lock-safe)."""
         if n <= 0:
@@ -169,39 +144,14 @@ class Model(BaseModel):
                 ),
             )
 
-    def clear_dirty_for_upload(
-        self,
-    ) -> tuple[
-        frozenset[int],
-        frozenset[int],
-        frozenset[int],
-        frozenset[int],
-        dict[int, bytes],
-    ]:
-        """Snapshot the four dirty/removed sets and clear them atomically.
+    def uploaded_hash_snapshot(self) -> dict[int, bytes]:
+        """Lock-safe copy of the per-object content hashes already uploaded.
 
-        Also returns a snapshot of ``uploaded_hash`` so the upload pass
-        works against a stable view; mutations to ``uploaded_hash``
-        during the upload (via ``update_uploaded_hashes`` /
-        ``drop_uploaded_hashes``) do not race with the dedupe filter.
+        The uploader uses this to skip re-sending objects whose content is
+        unchanged since the last batch within a single bring-up.
         """
         with self._lock:
-            dirty_fns = frozenset(self.dirty_functions)
-            dirty_gls = frozenset(self.dirty_globals)
-            removed_fns = frozenset(self.removed_functions)
-            removed_gls = frozenset(self.removed_globals)
-            uploaded_hash_snapshot = dict(self.uploaded_hash)
-            self.dirty_functions.clear()
-            self.dirty_globals.clear()
-            self.removed_functions.clear()
-            self.removed_globals.clear()
-            return (
-                dirty_fns,
-                dirty_gls,
-                removed_fns,
-                removed_gls,
-                uploaded_hash_snapshot,
-            )
+            return dict(self.uploaded_hash)
 
     def update_uploaded_hashes(self, hashes: dict[int, bytes]) -> None:
         """Record content hashes for objects whose upload was just acked."""
@@ -209,12 +159,6 @@ class Model(BaseModel):
             return
         with self._lock:
             self.uploaded_hash.update(hashes)
-
-    def drop_uploaded_hashes(self, addrs: Iterable[int]) -> None:
-        """Forget recorded hashes — call when objects are removed."""
-        with self._lock:
-            for a in addrs:
-                self.uploaded_hash.pop(a, None)
 
     @classmethod
     def create(cls, bv: BinaryView) -> "Model":

@@ -101,17 +101,9 @@ class RevisionUploader:
         """Order all planned addresses into one interleaved, callee/use-first
         stream.
 
-        Functions are ordered callees-first; each global is placed before every
-        function that references it (matching the IDA plugin's unified topo
-        sort). Thunks are dropped (accepted but never uploaded). The ordering
-        ``graph`` is kept separate from ``calls_by_addr`` so a global never
-        leaks into a function's hashed ``calls`` payload.
-
         Returns ``(ordered, calls_by_addr, function_addrs, global_addrs)``.
         """
-        fn_addrs, gl_addrs, _thunks = partition_addrs(
-            self._bv, self._planned_addrs
-        )
+        fn_addrs, gl_addrs, _ = partition_addrs(self._bv, self._planned_addrs)
         calls_by_addr: dict[int, set[int]] = {}
         for a in fn_addrs:
             func = self._bv.get_function_at(a)

@@ -8,8 +8,9 @@ widgets, no popups, no context menu.
 Colours come from the host (Binary Ninja) palette — the widget sets almost no
 colour itself. The only overrides are the two semantic accents (amber for the
 warning label + a high usage read-out, red for usage at/over budget) and the
-``Highlight`` role for the actionable ``changes`` label. The only motion — and
-the only hand-painted element — is the progress bar (``_BounceBar``): while
+``Highlight`` role for the actionable ``unregistered`` / ``ready`` labels. The
+only motion — and the only hand-painted element — is the progress bar
+(``_BounceBar``): while
 progress is unknown or still at 0% a single segment bounces back and forth on a
 small ``QTimer``, then it fills to the percentage once it climbs above 0
 (``paused`` is the exception — a frozen, greyed fill, never a bounce). The bar is
@@ -22,8 +23,8 @@ so the bounce→fill hand-off the busy states make has no style seam.
 The host drives it through the same contract methods as before
 (``set_state`` / ``set_progress`` / ``set_counts`` / ``set_warning_count`` /
 ``set_pause_reason`` / ``set_usage``) and listens to ``actionTriggered`` — but
-that signal now fires only on a left-click in the ``changes`` state. There is
-no menu.
+that signal now fires only on a left-click in an actionable state
+(``unregistered`` / ``ready``). There is no menu.
 
 All copy/label/usage logic still lives in the Qt-free ``state.py`` so it stays
 unit-testable; this module only wires those strings into widgets.
@@ -54,7 +55,7 @@ _ICON_DIR = Path(__file__).parent / "icons"
 
 # Fixed so the segment never reflows its status-bar neighbours as the label
 # length changes. (Just setFixedWidth — still a "high-level" construct.) Sized
-# for the longest label ("Changes detected · click to upload") plus the icon,
+# for the longest label ("Click to analyze with Zenyard") plus the icon,
 # the usage read-out and margins, so nothing elides.
 _WIDTH = 400
 _ICON_PX = 14
@@ -65,13 +66,8 @@ _AMBER = "#e0a93b"
 _CRIT = "#e2685f"
 
 # States that show the progress bar. The bar runs one unified behaviour: it
-# bounces (a hand-painted segment travelling wall-to-wall — BN's Qt style won't
-# animate setRange(0, 0) for us) while progress is unknown or still at 0%, and
-# fills determinately once a percentage climbs above 0. `queued` carries no
-# fraction, so it bounces its whole duration (its queue position rides the label
-# instead — see `state.state_label`); `uploading` / `server` bounce only at the
-# very start, then fill (`server`'s % also rides the label).
-# `paused` is the exception: a frozen, greyed fill — never a bounce.
+# bounces (a hand-painted segment travelling wall-to-wall while progress is
+# unknown or still at 0%
 _BAR_STATES = frozenset({"uploading", "queued", "server", "paused"})
 
 # Busy-bounce cadence. `_busy_phase` walks 0.._BUSY_PERIOD; one full out-and-back
@@ -286,7 +282,6 @@ class ZenyardStatusWidget(QWidget):
 
     _CLICK_ACTIONS = {
         "unregistered": "analyze",
-        "changes": "upload",
         "ready": "check_inferences",
     }
 

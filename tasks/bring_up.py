@@ -46,7 +46,6 @@ from .revision_upload import RevisionUploader
 from ..objects import (
     seq_number_for_cursor,
     extract_sections,
-    partition_addrs,
 )
 from ..ui.dialogs import (
     ZenyardProgressDialog,
@@ -63,11 +62,12 @@ _UPLOAD_BACKOFF_MAX = 60.0
 
 class BringUpTask(CancellableTask):
     """
-    One-shot per request. Drives a BinaryView from cold (or dirty) to a
-    finalized Revision: ensure setup → register (if needed) → upload sections
-    (if needed) → upload revision. Whether the revision is a full upload or a
-    dirty-only one is inferred from persisted state (``last_completed_revision``), so
-    boot and create-revision share one pipeline.
+    One-shot per request. Drives a BinaryView from cold to a finalized
+    Revision: ensure setup → register (if needed) → upload sections (if needed)
+    → upload revision. A binary is analyzed exactly once: once a revision has
+    completed (``last_completed_revision > 0``) the revision step is a no-op, so
+    reopening an already-analyzed binary never re-uploads or re-triggers
+    analysis.
     """
 
     def __init__(
@@ -134,7 +134,7 @@ class BringUpTask(CancellableTask):
         if self._instructions is None:
             log_warn("Not runnig analysis. user cancel!")
             return
-        
+
         self._do_register()
 
     def _do_register(self) -> None:
@@ -254,31 +254,14 @@ class BringUpTask(CancellableTask):
         if self._model.binary_id is None:
             return
 
-        (
-            dirty_fns,
-            dirty_gls,
-            removed_fns,
-            removed_gls,
-            prev_hashes,
-        ) = self._model.clear_dirty_for_upload()
+        prev_hashes = self._model.uploaded_hash_snapshot()
 
-        # Removed objects' content hashes are stale regardless of the
-        # upload outcome — drop them eagerly.
-        self._model.drop_uploaded_hashes(removed_fns | removed_gls)
-
-        addrs = self._plan_objects(dirty_fns, dirty_gls)
+        addrs = self._plan_objects()
         if addrs is None:
             return
 
-        # Status-bar denominator (read by Coordinator.progress_snapshot). The
-        # planned count; the uploader drops thunks/unchanged objects, so the
-        # final tally may be a touch lower — close enough for the progress bar.
         self.objects_total = len(addrs)
 
-        # Pop the progress dialog while objects are extracted + uploaded. It
-        # polls the live counters and its Cancel button calls request_cancel,
-        # which trips check_cancelled() in the extraction loop. Build it on the
-        # main thread, then let extraction proceed on this thread.
         def _open_dialog() -> ZenyardProgressDialog:
             dlg = ZenyardProgressDialog(
                 get_progress=lambda: (
@@ -302,31 +285,14 @@ class BringUpTask(CancellableTask):
                 ),
             ).run()
         except TaskCancelled:
-            # Cancelled mid-extraction: restore the dirty marks cleared above so
-            # the pending changes aren't silently lost. (A full/cold upload
-            # re-runs full anyway since last_completed_revision stays 0; this
-            # matters for the dirty-only path.)
-            for a in dirty_fns:
-                self._model.mark_function_dirty(a)
-            for a in dirty_gls:
-                self._model.mark_global_dirty(a)
+            # Cancelled mid-extraction: leave it. last_completed_revision stays
+            # 0, so the next open re-runs the full upload from scratch.
             return
         finally:
             # Tear the dialog down before any later modal (show_upload_complete):
             # an app-modal dialog left visible would block input to it. Blocking
             # close so teardown completes before the next dialog opens.
             execute_on_main_thread_and_wait(dlg.close)
-
-        if result.failed:
-            # Re-queue every planned object the backend never durably saw
-            # (includes the unsent batch) so the next upload retries it.
-            # Thunks are never uploaded, so they need no re-queue.
-            fn_addrs, gl_addrs, _thunks = partition_addrs(self._bv, addrs)
-            for a in set(fn_addrs) - result.uploaded_function_addrs:
-                self._model.mark_function_dirty(a)
-            for a in set(gl_addrs) - result.uploaded_global_addrs:
-                self._model.mark_global_dirty(a)
-            return
 
         self.objects_uploaded = result.uploaded_count
         log_info(
@@ -344,16 +310,20 @@ class BringUpTask(CancellableTask):
 
     def _plan_objects(
         self,
-        dirty_fns: frozenset[int],
-        dirty_gls: frozenset[int],
     ) -> list[int] | None:
         """Decide which object addresses to upload.
 
         Returns a single flat ``list[int]`` of addresses — functions, globals,
         and thunks intermixed — for the uploader to partition and stream. The
         type of each address is resolved downstream by ``partition_addrs``.
+
+        ``None`` once the binary has already been analyzed
+        (``last_completed_revision > 0``): a binary is analyzed exactly once, so
+        a reopen must not re-upload and re-trigger analysis.
         """
-        full = self._model.last_completed_revision == 0
+        if self._model.last_completed_revision > 0:
+            return None
+
         container = pathlib.Path(self._bv.file.filename).name
         ignored = IgnoredSections(container)
 
@@ -374,19 +344,10 @@ class BringUpTask(CancellableTask):
             all_gls, ignored, keep_nameless_sections
         )
 
-        # step 3: remove non-dirty (first upload treats everything as dirty)
-        if not full:
-            fn_addrs &= dirty_fns
-            gl_addrs &= dirty_gls
-            if not fn_addrs and not gl_addrs:
-                log_warn("no dirty objects to upload")
-                return None
-
         addrs = [*fn_addrs, *gl_addrs]
         if not addrs:
             log_warn("no objects to upload")
             return None
-        log_debug(f"dirty objects [{addrs}]")
         return addrs
 
     def _keep_object_addrs(

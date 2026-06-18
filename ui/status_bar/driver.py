@@ -202,21 +202,12 @@ class _StatusBarController:
         bv = self._current_bv
         coord = get_coordinator_for_bv(bv) if bv is not None else None
         if key == "analyze":
-            # `unregistered` state: register + analyze. Unlike the run/upload
-            # keys below, this is allowed precisely *because* binary_id is None
-            # — the coordinator's create-revision handler re-runs bring-up to
-            # register. coord may be None if the file closed since the tick.
+            # `unregistered` state: register + analyze. The coordinator's
+            # create-revision handler re-runs bring-up to register precisely
+            # because binary_id is None. coord may be None if the file closed
+            # since the tick.
             if coord is not None:
                 coord.post(UserAction("create_revision"))
-        elif key in ("run", "rerun", "upload"):
-            if coord is None or coord.model.binary_id is None:
-                show_message_box(
-                    "Zenyard",
-                    "Binary not yet registered. Please wait for registration "
-                    "to complete.",
-                )
-                return
-            coord.post(UserAction("create_revision"))
         elif key == "check_inferences":
             if coord is not None and coord.model.binary_id is not None:
                 coord.post(UserAction("check_inferences"))

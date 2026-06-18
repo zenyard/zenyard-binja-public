@@ -8,7 +8,6 @@ from binaryninja import (  # type: ignore[import]
 )
 from binaryninja.log import Logger
 
-from ..change_tracker import ChangeTracker
 from ..helpers.apply_inferences import apply_inferences
 from ..helpers.inference_types import InferenceItem
 from ..helpers.log import log_error, use_logger
@@ -22,14 +21,12 @@ _LOOP_RECOVER_DELAY = 2.0
 
 
 class ApplyInferencesTask(CancellableTask):
-
     def __init__(
         self,
         *,
         bv: BinaryView,
         model: Model,
         channel: "queue.Queue[tuple[list[InferenceItem], int]]",
-        change_tracker: ChangeTracker,
         stop: threading.Event,
         logger: Logger | None = None,
     ) -> None:
@@ -37,7 +34,6 @@ class ApplyInferencesTask(CancellableTask):
         self._bv = bv
         self._model = model
         self._channel = channel
-        self._change_tracker = change_tracker
         self._idle_cv = threading.Condition()
         self._in_batch = False
         self.applied = 0
@@ -67,27 +63,17 @@ class ApplyInferencesTask(CancellableTask):
                     continue
                 batch, cursor = page
                 if batch:
-                    with self._change_tracker.paused():
-                        # apply_inferences runs on the main thread, whose
-                        # context isn't bound to this session — scope the bind
-                        # to the callback so its log lines route to this tab,
-                        # then revert.
-                        def _apply() -> int:
-                            with use_logger(self._logger):
-                                return apply_inferences(
-                                    self._bv, batch, self._model
-                                )
 
-                        applied = run_on_main_thread(_apply)
-                        # Drain analysis here (BG thread) so notifications
-                        # fired during the analysis pass still see paused ==
-                        # True. BN forbids waiting from the UI thread, so it
-                        # can't happen inside the callback above.
-                        self._bv.update_analysis_and_wait()
+                    def _apply() -> int:
+                        with use_logger(self._logger):
+                            return apply_inferences(
+                                self._bv, batch, self._model
+                            )
+
+                    applied = run_on_main_thread(_apply)
+                    self._bv.update_analysis_and_wait()
                     self.applied += applied
                     self._model.add_applied(applied)
-                # Only now is the page durably applied; an exception above
-                # leaves the cursor behind so the page replays next session.
                 self._model.inference_cursor = cursor
             except TaskCancelled:
                 # Cancellation/shutdown still ends the consumer cleanly.

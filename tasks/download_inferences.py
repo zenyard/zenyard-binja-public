@@ -48,30 +48,6 @@ class _Target:
 
 
 class DownloadInferencesTask(LongLivedTask):
-    """
-    Long-lived. Drives one fetch cycle per ``set_target(...)`` call: polls the
-    server until the target revision is analysed, then fetches inference pages
-    and pushes them — each as ``(items, end_cursor)`` — onto a shared
-    ``queue.Queue`` (one page per slot). The queue is bounded to size 1 — when
-    ``ApplyInferencesTask`` is behind, the next ``put`` blocks; that is the
-    backpressure mechanism. This task never writes ``model.inference_cursor``;
-    the apply side persists it once a page is actually applied.
-
-    Cooperative interruption while a cycle is in flight is via
-    ``request_drain()``: at the next page boundary (or while blocked on
-    ``channel.put``) the cycle exits cleanly and the Task returns to idle. The
-    Coordinator uses this during Create Revision to stop the stream so a new
-    dirty-only bringup can run.
-
-    Errors on individual API calls are classified (``helpers.retry.classify``):
-    transient ones (connection loss, timeouts, 5xx) are retried **forever**
-    with exponential backoff — an outage can never end the cycle, so the
-    stream resumes by itself when connectivity returns. Any other disposition
-    (auth, stale binary, bug) stops the cycle cleanly with a log; retrying
-    those cannot help. ``consecutive_failures`` exposes the current outage to
-    the status bar ("Reconnecting…").
-    """
-
     def __init__(
         self,
         *,

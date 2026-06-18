@@ -12,7 +12,7 @@ from binaryninja import (
 )  # type: ignore[import]
 
 from ..api_client import make_client
-from ..change_tracker import ChangeTracker
+
 from ..configuration import (
     DEFAULT_MAX_BINARY_SIZE_MB,
     get_cached_max_binary_size_mb,
@@ -86,8 +86,6 @@ class Coordinator(BackgroundTaskThread):
         self._channel: queue.Queue[tuple[list[InferenceItem], int]] = (
             queue.Queue(maxsize=1)
         )
-        self._change_tracker = ChangeTracker(self._model)
-        self._change_tracker_registered = False
         self._download: DownloadInferencesTask | None = None
         self._apply: ApplyInferencesTask | None = None
         self._current_bring_up: BringUpTask | None = None
@@ -150,12 +148,6 @@ class Coordinator(BackgroundTaskThread):
             binary_registered = m.binary_id is not None
             first_revision_done = m.last_completed_revision > 0
             applied_total = m.applied_count
-            dirty_count = (
-                len(m.dirty_functions)
-                + len(m.dirty_globals)
-                + len(m.removed_functions)
-                + len(m.removed_globals)
-            )
 
         return RunSnapshot(
             binary_registered=binary_registered,
@@ -177,7 +169,6 @@ class Coordinator(BackgroundTaskThread):
             applied=applied,
             queued=queued,
             applied_total=applied_total,
-            dirty_count=dirty_count,
         )
 
     def is_idle(self) -> bool:
@@ -309,8 +300,6 @@ class Coordinator(BackgroundTaskThread):
             )
 
     def _enter_steady_state(self) -> None:
-        """Register the change tracker and start the long-lived download/apply
-        tasks. Idempotent: a no-op once started (guarded on ``_download``)."""
         if self._download is not None:
             return
         assert self._api is not None
@@ -336,22 +325,14 @@ class Coordinator(BackgroundTaskThread):
             self._handle_action(action)
 
     def _ensure_inference_pipeline_started(self) -> None:
-        """Idempotently start the change tracker + apply/download tasks.
-
-        Requires ``binary_id`` to be known. Safe to call repeatedly; only the
-        first call starts the tasks."""
         if self._apply is not None:
             return
         assert self._api is not None
-        self._bv.register_notification(self._change_tracker)
-        self._change_tracker_registered = True
-        log_debug("change tracker registered")
 
         self._apply = ApplyInferencesTask(
             bv=self._bv,
             model=self._model,
             channel=self._channel,
-            change_tracker=self._change_tracker,
             stop=self._stop,
             logger=self._logger,
         )
@@ -433,31 +414,9 @@ class Coordinator(BackgroundTaskThread):
             self._enter_steady_state()
             return
 
-        assert self._download is not None
-        assert self._apply is not None
-        log_debug("create_revision: draining download…")
-        self._download.request_drain()
-        self._download.wait_idle()
-        self._apply.wait_idle()
-        if self._stop.is_set():
-            return
-        log_debug("create_revision: starting dirty-only bring-up")
-        self._run_bring_up()
-        if self._stop.is_set():
-            return
-
-        # Always poll the server after an upload.
-        auto_apply = self._model.auto_apply
-        self._download.set_target(
-            target_revision=self._model.last_completed_revision,
-            start_cursor=self._model.inference_cursor,
-            apply=auto_apply,
-        )
-        if not auto_apply:
-            log_info(
-                "auto-apply off; polling for readiness — apply via"
-                " 'Check Inferences' when ready"
-            )
+        # Already registered: a binary is analyzed exactly once, so there is
+        # nothing to re-upload. Reachable only defensively — the status bar
+        # posts create_revision solely from the unregistered "analyze" click.
 
     def _handle_check_inferences(self) -> None:
         if self._auth_blocked:
@@ -491,12 +450,6 @@ class Coordinator(BackgroundTaskThread):
             self._apply.cancel()
         if self._current_bring_up is not None:
             self._current_bring_up.cancel()
-        if self._change_tracker_registered:
-            try:
-                self._bv.unregister_notification(self._change_tracker)
-            except Exception:
-                pass
-            self._change_tracker_registered = False
 
 
 # ── Process-level registry ────────────────────────────────────────────────────

@@ -36,9 +36,7 @@ from .server import BinaryMcpServer
 
 
 def _relay_id_for(bv: ty.Any) -> str:
-    """Stable, immediately-available routing id derived from the file path.
-
-    """
+    """Stable, immediately-available routing id derived from the file path."""
     digest = hashlib.sha256(
         canonical_db_name(bv.file.filename).encode("utf-8")
     ).hexdigest()

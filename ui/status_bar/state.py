@@ -34,7 +34,6 @@ from dataclasses import dataclass
 STATES = (
     "unregistered",
     "idle",
-    "changes",
     "extracting",
     "uploading",
     "queued",
@@ -79,26 +78,13 @@ class RunSnapshot:
     analysis_ready: bool = False  # server done; results ready, not yet applied
     apply_active: bool = False  # a batch is being applied / queue non-empty
 
-    # Server-side analysis progress (drives the `server` state's % bar). The
-    # ratio matches the poll loop's completion test, so it reaches 1.0 exactly
-    # when analysis is declared ready. ``server_revision`` is the effective
-    # analysed revision level (e.g. 2.375); ``target_revision`` the denominator.
     server_revision: float = 0.0
     target_revision: int = 0
 
-    # Server queue position while analysis hasn't started (None once running).
-    # Drives the `queued` state.
     queue_position: int | None = None
 
-    # Consecutive transient backend failures in the active phase (bring-up or
-    # download). Drives the `reconnecting` state once past the grace.
     connection_failures: int = 0
 
-    # Permanent-disposition postures (see helpers.retry.classify). The
-    # Coordinator latches these when a backend call fails with a non-transient
-    # disposition: ``auth_blocked`` on 401/403 (bad/expired key — analysis is
-    # disabled until fixed), ``stale_binary`` on 404 (binary gone server-side).
-    # Each drives its own resting state, ranked above the run states.
     auth_blocked: bool = False
     stale_binary: bool = False
 
@@ -108,8 +94,6 @@ class RunSnapshot:
     applied: int = 0
     queued: int = 0
     applied_total: int = 0  # total inferences stored on the model
-
-    dirty_count: int = 0  # changed objects pending upload (drives `changes`)
 
     warning_count: int = 0
 
@@ -227,25 +211,12 @@ def derive_view_state(
         "downloaded": snap.downloaded,
         "queued": snap.queued,
         "applied": snap.applied,
-        "dirty": snap.dirty_count,
-        # `queued` above counts inferences awaiting local apply; this is the
-        # server queue position (only meaningful in the `queued` state).
         "queue_position": snap.queue_position or 0,
     }
 
-    # An active run takes precedence; otherwise pending edits ("changes") rank
-    # ahead of the terminal `applied`/`idle` — they are newer than the last
-    # applied result, and `changes` is not gated on registration (it fires on
-    # any binary, first run or re-run, the moment objects are dirty).
-    # An outage outranks the run states it overlays: a frozen bar or stale
-    # queue position is exactly the looks-like-a-hang impression this kills.
     if snap.auth_blocked:
-        # Bad/expired key: analysis is disabled until fixed. Ranks above the
-        # run/outage states — retrying can't help, so "Reconnecting…" would
-        # mislead. (See the Coordinator's auth-blocked posture.)
         state = "auth_error"
     elif snap.stale_binary:
-        # Binary gone server-side (404): the run can't proceed against it.
         state = "stale"
     elif snap.connection_failures >= _RECONNECT_AFTER_FAILURES and (
         snap.bring_up_active or snap.download_active or snap.download_waiting
@@ -259,8 +230,6 @@ def derive_view_state(
         state = "queued"
     elif snap.download_waiting:
         state = "server"
-    elif snap.dirty_count > 0:
-        state = "changes"
     elif snap.analysis_ready:
         # Server finished analysing but auto-apply is off: results are waiting.
         state = "ready"
@@ -329,21 +298,12 @@ def tooltip_copy(
     total = counts.get("total", 0)
     uploaded = counts.get("uploaded", 0)
     applied = applied_total or counts.get("applied", 0)
-    dirty = counts.get("dirty", 0)
 
     if state == "unregistered":
         return (
             "Analyze with Zenyard",
             "This binary hasn't been analyzed yet. Click to start analyzing "
             "it with Zenyard.",
-        )
-    if state == "changes":
-        return (
-            "Changes detected",
-            f"{dirty} objects changed since the last run. "
-            "Click to extract and upload."
-            if dirty
-            else "Changes detected. Click to extract and upload.",
         )
     if state == "extracting":
         return (
@@ -440,7 +400,6 @@ def tooltip_copy(
 STATE_LABEL: dict[str, tuple[str, str]] = {
     "unregistered": ("Click to analyze with Zenyard", "accent"),
     "idle": ("Ready", "dim"),
-    "changes": ("Changes detected · click to upload", "accent"),
     "extracting": ("Extracting objects", "normal"),
     "uploading": ("Uploading objects", "normal"),
     "queued": ("In queue", "normal"),

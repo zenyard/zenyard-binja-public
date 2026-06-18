@@ -71,14 +71,9 @@ def apply_inferences(
     Returns the number of inferences actually applied — items with no
     registered handler are skipped and not counted.
 
-    Must be called on the main thread and MUST be invoked inside a
-    ``ChangeTracker.paused()`` context (see ``ApplyInferencesTask._run``).
-    The trailing ``update_analysis()`` only kicks off analysis; the caller
-    then waits for it to drain on the background thread (BN forbids the UI
-    thread from calling ``update_analysis_and_wait``), keeping the paused
-    context open across the analysis pass so the resulting
-    ``function_updated`` / ``data_var_updated`` notifications are observed
-    while the tracker is still paused.
+    Must be called on the main thread. The trailing ``update_analysis()`` only
+    kicks off analysis; the caller then waits for it to drain on the background
+    thread (BN forbids the UI thread from calling ``update_analysis_and_wait``).
     """
     fn_cache: dict[int, BnFunction | None] = {}
     applied = 0
