@@ -322,9 +322,15 @@ def tooltip_copy(
             f"Analysis hasn't started yet · {n} ahead in the queue.",
         )
     if state == "server":
-        head = "Analyzing on server"
-        if pct is not None:
-            head = f"{head} · {pct}%"
+        if pct == 0:
+            # Exactly 0%: the server has reported no revision progress yet — it
+            # is still preparing the binary. Mirror the label and drop the %
+            # read-out; the bar stays a busy sweep.
+            head = "Server preparing binary"
+        elif pct is not None:
+            head = f"Analyzing on server · {pct}%"
+        else:
+            head = "Analyzing on server"
         return (
             head,
             f"{uploaded} objects uploaded. Waiting for inferences…",
@@ -426,13 +432,18 @@ def state_label(
     Kept Qt-free here (alongside the rest of the copy logic) so the suffixing is
     unit-testable. The `server` state shows its progress as a label suffix —
     "Analyzing on server… 79%" — because its bar runs the indeterminate busy
-    marquee and carries no value. The `queued` state likewise rides its queue
-    position — "In queue (5 remaining)".
+    marquee and carries no value. At exactly 0% it reads "Server preparing
+    binary" instead (the server has reported no revision progress yet). The
+    `queued` state likewise rides its queue position — "In queue (5 remaining)".
     """
 
     text, role = STATE_LABEL.get(state, ("Zenyard", "dim"))
     if state == "warning":
         text = text.format(n=warning_count)
+    elif state == "server" and pct == 0:
+        # Exactly 0%: still preparing the binary (no revision progress yet).
+        # Drop the "0%" suffix; the bar keeps its busy sweep unchanged.
+        text = "Server preparing binary"
     elif state == "server" and pct is not None:
         text = f"{text} {pct}%"
     elif state == "queued" and queue_position is not None:
