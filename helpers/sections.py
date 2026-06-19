@@ -91,6 +91,11 @@ class IgnoredSections:
         return False
 
 
+def is_dsc_view(bv: BinaryView) -> bool:
+    """True for an Apple dyld shared cache view (DSCView)."""
+    return "dscview" in bv.view_type.lower()
+
+
 def _get_dsc_controller(bv: BinaryView):
     """Return the SharedCacheController for `bv`, or None if not a DSC view."""
     try:
@@ -128,13 +133,51 @@ def get_platform(bv: BinaryView) -> str | None:
     return None
 
 
+# Auto-loaded dependency dylibs to exclude from a DSC's loaded-size estimate
+# (matched as substrings of the image path). In a DSC, the deps analysis pulls
+# in are the low-level system libs under /usr/lib/ (libobjc, libsystem_*, ...).
+_DSC_AUTOLOADED_PREFIXES = ("/usr/lib/",)
+
+
+def _dsc_loaded_size(bv: BinaryView) -> int | None:
+    """Estimated size of the frameworks a user explicitly loaded into a DSC
+    view: sum of IMAGE region bytes, excluding the /usr/lib/ system dylibs that
+    analysis auto-pulls in. Returns None when the shared-cache controller is
+    unavailable (caller then falls back to the generic measurement)."""
+    controller = _get_dsc_controller(bv)
+    if controller is None:
+        return None
+    try:
+        from binaryninja.sharedcache import SharedCacheRegionType
+    except ImportError:
+        return None
+    image_type = SharedCacheRegionType.SharedCacheRegionTypeImage
+    names = {im.header_address: im.name for im in controller.images}
+    total = 0
+    for region in controller.loaded_regions:
+        if region.region_type != image_type:
+            continue
+        name = names.get(region.image_start)
+        if name is None or any(p in name for p in _DSC_AUTOLOADED_PREFIXES):
+            continue
+        total += region.size
+    return total
+
+
 def binary_mapped_size(bv: BinaryView) -> int:
     """Approximate input-binary size: total bytes the loader mapped from the
     input file (the Binja analog of IDA's file-mapped segment sum).
 
+    For a DSC view, measures the user-loaded frameworks (excluding auto-loaded
+    /usr/lib/ deps) instead, since DSC segments are not file-backed.
+
     Falls back to the raw view's length for segment-less views, and to 0 when
     nothing is measurable — never block on a size we can't compute.
     """
+    if is_dsc_view(bv):
+        dsc_size = _dsc_loaded_size(bv)
+        if dsc_size is not None:
+            return dsc_size
     total = sum(seg.data_length for seg in bv.segments)
     if total > 0:
         return total

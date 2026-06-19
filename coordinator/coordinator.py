@@ -34,7 +34,7 @@ from ..helpers.retry import (
     _GaveUp,
     call_backend,
 )
-from ..helpers.sections import binary_mapped_size
+from ..helpers.sections import binary_mapped_size, is_dsc_view
 from ..mcp_server.endpoint import BinaryMcpEndpoint
 from ..mcp_server.ports import get_port_pool
 from ..model import Model
@@ -94,6 +94,7 @@ class Coordinator(BackgroundTaskThread):
         self._mcp = BinaryMcpEndpoint(
             self._bv, ports=get_port_pool(), logger=self._logger
         )
+        self._is_dyld = is_dsc_view(self._bv)
 
     # ── Public surface ────────────────────────────────────────────────────────
 
@@ -203,14 +204,13 @@ class Coordinator(BackgroundTaskThread):
             except Exception as e:
                 log_request_error("Coordinator: failed to start MCP server", e)
 
-            if not self._size_blocked:
+            if not self._size_blocked and not self._is_dyld:
                 self._run_bring_up()
             if self._stop.is_set():
                 return
+
             # Registration may not have happened
             # Don't exit: stay in the action loop so a later "Create Revision"
-            # can register and bring up.
-            # The MCP server + relay stay available even while unregistered
             if not self._size_blocked and self._model.binary_id is not None:
                 self._mcp.set_binary_id(self._model.binary_id)
                 self._enter_steady_state()
@@ -401,7 +401,9 @@ class Coordinator(BackgroundTaskThread):
         if self._auth_blocked:
             execute_on_main_thread(show_auth_error)
             return
-        if self._size_blocked and not self._check_binary_size_allowed():
+        if (
+            self._size_blocked or self._is_dyld
+        ) and not self._check_binary_size_allowed():
             return
 
         if self._model.binary_id is None:

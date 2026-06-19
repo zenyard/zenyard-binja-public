@@ -26,6 +26,7 @@ from ..helpers.sections import (
     IgnoredSections,
     get_section_compressed,
     get_platform,
+    is_dsc_view,
     is_swift_binary,
 )
 from ..helpers.log import (
@@ -330,7 +331,7 @@ class BringUpTask(CancellableTask):
         # in dsc view (apple shared cache file) we want to drop
         # "Nameless" sections, in other file format, we keep them
         # as they just might have been stripped.
-        keep_nameless_sections = "DSCView" not in self._bv.view
+        keep_nameless_sections = not is_dsc_view(self._bv)
 
         # step 1: gather all symbols
         all_fns = {f.start for f in self._bv.functions}
