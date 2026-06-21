@@ -3,7 +3,7 @@ import contextvars
 import traceback
 
 from collections import Counter
-from binaryninja.log import Logger
+from binaryninja.log import Logger  # type: ignore[import]
 from ..zenyard_client.exceptions import ApiException
 
 _MAX_SECTION_COUNTS_LOGGED = 60

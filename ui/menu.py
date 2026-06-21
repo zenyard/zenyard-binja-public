@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from binaryninja import FunctionViewType
+from binaryninja import FunctionViewType  # type: ignore[import]
 from binaryninjaui import UIActionContext, UIAction, UIActionHandler, Menu  # type: ignore[import]
 
 from ..coordinator.coordinator import get_coordinator_for_bv

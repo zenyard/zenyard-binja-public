@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import typing as ty
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 from binaryninja import BinaryView, FunctionParameter, Type  # type: ignore[import]
-from binaryninja import Function as BnFunction
+from binaryninja import Function as BnFunction  # type: ignore[import]
 
 from .log import log_debug, log_info, log_warn
 
+from ..pseudo_swift.metadata_keys import (
+    NOT_SWIFT_FUNCTION_METADATA_KEY,
+    SWIFT_FUNCTION_METADATA_KEY,
+)
 from ..zenyard_client.models import (
     FunctionOverview,
     Name,
@@ -43,7 +48,7 @@ def _batched(
 class HandlerSpec:
     apply: ty.Callable[..., None]
     scope: ty.Literal["bv", "address"]
-    needs_model: bool = field(default=False)
+    undoable: bool = field(default=True)
 
 
 _HANDLERS: dict[type, HandlerSpec] = {}
@@ -52,10 +57,10 @@ _HANDLERS: dict[type, HandlerSpec] = {}
 def _register(
     inf_type: type,
     scope: ty.Literal["bv", "address"],
-    needs_model: bool = False,
+    undoable: bool = True,
 ) -> ty.Callable[[ty.Callable[..., None]], ty.Callable[..., None]]:
     def decorator(fn: ty.Callable[..., None]) -> ty.Callable[..., None]:
-        _HANDLERS[inf_type] = HandlerSpec(fn, scope, needs_model)
+        _HANDLERS[inf_type] = HandlerSpec(fn, scope, undoable)
         return fn
 
     return decorator
@@ -101,11 +106,13 @@ def apply_inferences(
                 continue
             addr = getattr(inf, "address", "bv-level")
             log_debug(f"applying {type(inf).__name__} at {addr}")
-            with bv.undoable_transaction():  # pyright: ignore[reportGeneralTypeIssues]
-                if spec.needs_model and model is not None:
-                    spec.apply(bv, inf, model, fn_cache)
-                else:
-                    spec.apply(bv, inf, fn_cache)
+            ctx = (
+                bv.undoable_transaction()  # pyright: ignore[reportGeneralTypeIssues]
+                if spec.undoable
+                else nullcontext()
+            )
+            with ctx:
+                spec.apply(bv, inf, fn_cache)
             applied += 1
             if not isinstance(inf, (SwiftFunction, NotSwift)):
                 addr_str = getattr(inf, "address", None)
@@ -317,11 +324,10 @@ def _apply_variables_mapping(
         log_info(f"renamed variables at {inf.address}: {', '.join(renamed)}")
 
 
-@_register(SwiftFunction, "address", needs_model=True)
+@_register(SwiftFunction, "address", undoable=False)
 def _apply_swift_function(
     bv: BinaryView,
     inf: SwiftFunction,
-    model: Model,
     fn_cache: dict[int, BnFunction | None] | None = None,
 ) -> None:
     if inf.profile != TranslationProfile.BALANCED:
@@ -330,18 +336,24 @@ def _apply_swift_function(
         )
         return
     addr = int(inf.address, 16)
-    model.set_swift_inference(addr, inf.to_dict())
-    log_info(f"received swift inference {inf.to_dict()}")
+    func = _get_function_at(bv, addr, fn_cache)
+    if func is None:
+        log_debug(f"no function at {inf.address} for SwiftFunction")
+        return
+    func.store_metadata(SWIFT_FUNCTION_METADATA_KEY, inf.to_dict())
     log_info(f"stored Swift source for function at {inf.address}")
 
 
-@_register(NotSwift, "address", needs_model=True)
+@_register(NotSwift, "address", undoable=False)
 def _apply_not_swift(
     bv: BinaryView,
     inf: NotSwift,
-    model: Model,
     fn_cache: dict[int, BnFunction | None] | None = None,
 ) -> None:
     addr = int(inf.address, 16)
-    model.set_not_swift_inference(addr, inf.to_dict())
+    func = _get_function_at(bv, addr, fn_cache)
+    if func is None:
+        log_debug(f"no function at {inf.address} for NotSwift")
+        return
+    func.store_metadata(NOT_SWIFT_FUNCTION_METADATA_KEY, inf.to_dict())
     log_info(f"stored NotSwift ({inf.reason}) at {inf.address}")

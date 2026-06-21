@@ -4,7 +4,7 @@ import threading
 import traceback
 from typing import Any
 from binaryninja import BackgroundTaskThread  # type: ignore[import]
-from binaryninja.log import Logger
+from binaryninja.log import Logger  # type: ignore[import]
 from ..helpers.log import bind_logger, log_error
 
 
@@ -20,14 +20,14 @@ class CancellableTask(BackgroundTaskThread):
         logger: Logger | None = None,
     ) -> None:
         super().__init__(title, can_cancel=True)
-        self._stop = stop
+        self._stop_event = stop
         # This task's per-session logger, supplied by the Coordinator. Bound to
         # this thread once in ``run`` so every leaf ``log_*`` call below it —
         # including the helper modules it calls — routes to the right tab.
         self._logger = logger
-        # Per-task cancel, distinct from the shared coordinator ``_stop`` (which
-        # tears down the whole plugin). UI affordances like the extraction
-        # progress dialog's Cancel button set this — never ``_stop``.
+        # Per-task cancel, distinct from the shared coordinator ``_stop_event``
+        # (which tears down the whole plugin). UI affordances like the extraction
+        # progress dialog's Cancel button set this — never ``_stop_event``.
         self._cancel_requested = threading.Event()
 
     def run(self) -> None:
@@ -58,7 +58,7 @@ class CancellableTask(BackgroundTaskThread):
 
     def is_cancelled(self) -> bool:
         return (
-            self._stop.is_set()
+            self._stop_event.is_set()
             or self.cancelled
             or self._cancel_requested.is_set()
         )
@@ -68,7 +68,7 @@ class CancellableTask(BackgroundTaskThread):
             raise TaskCancelled()
 
     def sleep_or_cancel(self, seconds: float) -> None:
-        if self._stop.wait(seconds) or self.cancelled:
+        if self._stop_event.wait(seconds) or self.cancelled:
             raise TaskCancelled()
 
 
@@ -80,7 +80,7 @@ class LongLivedTask(CancellableTask):
     Long-lived worker built on :class:`CancellableTask`'s stop/cancel
     semantics. Stays in BN's task panel for its lifetime: idle by default;
     runs one unit of work when ``_submit(payload)`` is called; returns to
-    idle. The shared ``_stop`` event and BN's ``cancelled`` flag terminate
+    idle. The shared ``_stop_event`` and BN's ``cancelled`` flag terminate
     the loop at the next safe boundary — same semantics as
     :class:`CancellableTask`, just applied across many work units instead of
     once.
@@ -147,7 +147,7 @@ class LongLivedTask(CancellableTask):
 
     def _run(self) -> None:
         # Periodic wake (0.5s) so the loop re-checks self.is_cancelled() even
-        # when _stop / BN's `cancelled` flip without notifying this cv.
+        # when _stop_event / BN's `cancelled` flip without notifying this cv.
         while not self.is_cancelled():
             with self._cv:
                 self._cv.wait_for(

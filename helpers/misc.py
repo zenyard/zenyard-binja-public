@@ -1,4 +1,4 @@
-import binaryninja
+import binaryninja  # type: ignore[import]
 
 EXT = ".bndb"
 

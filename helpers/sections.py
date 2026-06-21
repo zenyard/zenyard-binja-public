@@ -1,6 +1,6 @@
 import collections
 import zstandard
-from binaryninja import BinaryView, Section as BNSection
+from binaryninja import BinaryView, Section as BNSection  # type: ignore[import]
 from .log import log_debug
 
 
@@ -99,7 +99,7 @@ def is_dsc_view(bv: BinaryView) -> bool:
 def _get_dsc_controller(bv: BinaryView):
     """Return the SharedCacheController for `bv`, or None if not a DSC view."""
     try:
-        from binaryninja.sharedcache import SharedCacheController
+        from binaryninja.sharedcache import SharedCacheController  # type: ignore[import]
     except ImportError:
         return None
     controller = SharedCacheController(bv)
@@ -148,7 +148,7 @@ def _dsc_loaded_size(bv: BinaryView) -> int | None:
     if controller is None:
         return None
     try:
-        from binaryninja.sharedcache import SharedCacheRegionType
+        from binaryninja.sharedcache import SharedCacheRegionType  # type: ignore[import]
     except ImportError:
         return None
     image_type = SharedCacheRegionType.SharedCacheRegionTypeImage

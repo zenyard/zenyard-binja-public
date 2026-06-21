@@ -7,7 +7,7 @@ import traceback
 import typing as ty
 from dataclasses import dataclass
 
-from binaryninja.log import Logger
+from binaryninja.log import Logger  # type: ignore[import]
 
 from ..helpers.inference_types import InferenceItem
 from ..helpers.log import (
@@ -363,7 +363,7 @@ class DownloadInferencesTask(LongLivedTask):
             max_retries=None,
             base_delay=_ERROR_BACKOFF_BASE,
             max_delay=_ERROR_BACKOFF_MAX,
-            stop=self._stop,
+            stop=self._stop_event,
             should_stop=lambda: self._drain.is_set() or self.is_cancelled(),
             on_permanent=self._on_permanent_error,
             on_failure_count=lambda n: setattr(self, "consecutive_failures", n),
@@ -379,7 +379,7 @@ class DownloadInferencesTask(LongLivedTask):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return True
-            if self._stop.wait(min(0.5, remaining)) or self.cancelled:
+            if self._stop_event.wait(min(0.5, remaining)) or self.cancelled:
                 raise TaskCancelled()
 
     # ── Channel put with cooperative drain ────────────────────────────────────

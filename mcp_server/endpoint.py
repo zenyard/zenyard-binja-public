@@ -25,7 +25,7 @@ import typing as ty
 from uuid import UUID
 
 from binaryninja import BinaryView  # type: ignore[import]
-from binaryninja.log import Logger
+from binaryninja.log import Logger  # type: ignore[import]
 
 from ..configuration import get_api_key, get_api_url
 from ..helpers.log import log_debug, log_error, log_info, log_request_error

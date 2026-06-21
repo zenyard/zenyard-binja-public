@@ -89,7 +89,7 @@ class _StatusBarController:
         self._timer.setInterval(_POLL_MS)
         self._timer.timeout.connect(self._tick)
 
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._usage_thread = threading.Thread(
             target=self._usage_loop, daemon=True
         )
@@ -157,7 +157,7 @@ class _StatusBarController:
         """Poll the usage endpoint off the main thread until stopped."""
 
         poll_failing = False
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             info: UsageInfo | None = None
             if get_api_key():
                 try:
@@ -175,7 +175,7 @@ class _StatusBarController:
                         log_warn(f"usage poll failed: {e}")
                     poll_failing = True
             execute_on_main_thread(lambda i=info: self._apply(i))
-            if self._stop.wait(POLL_USAGE_S):
+            if self._stop_event.wait(POLL_USAGE_S):
                 break
 
     def _apply(
@@ -193,7 +193,7 @@ class _StatusBarController:
             self._widget.set_usage(usage)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self._timer.stop()
 
     # ── Actions ───────────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 from pygments.lexers import SwiftLexer
 from pygments.token import Comment, Keyword, Name, Number, Punctuation, String
 
-from binaryninja import InstructionTextTokenType
+from binaryninja import InstructionTextTokenType  # type: ignore[import]
 
 
 _LEXER = SwiftLexer()

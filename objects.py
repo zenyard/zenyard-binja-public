@@ -1,10 +1,10 @@
 import typing as ty
 from itertools import groupby
 
-from binaryninja import LinearViewObject, LinearViewCursor
-from binaryninja import LinearDisassemblyLine, LinearDisassemblyLineType
-from binaryninja import InstructionTextTokenType, SectionSemantics
-from binaryninja import BinaryView, Function as BNFunction
+from binaryninja import LinearViewObject, LinearViewCursor  # type: ignore[import]
+from binaryninja import LinearDisassemblyLine, LinearDisassemblyLineType  # type: ignore[import]
+from binaryninja import InstructionTextTokenType, SectionSemantics  # type: ignore[import]
+from binaryninja import BinaryView, Function as BNFunction  # type: ignore[import]
 from .helpers.log import log_debug, log_warn
 
 from .zenyard_client.models import (

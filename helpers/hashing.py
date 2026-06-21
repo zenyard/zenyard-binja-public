@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Iterator, Optional, Union
-from binaryninja import BinaryView
+from binaryninja import BinaryView  # type: ignore[import]
 
 from ..zenyard_client.models import (
     AddressDetail,

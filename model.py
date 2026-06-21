@@ -32,9 +32,6 @@ class Model(BaseModel):
 
     auto_apply: bool = True
 
-    swift_inferences: dict[int, dict] = Field(default_factory=dict)
-    not_swift_inferences: dict[int, dict] = Field(default_factory=dict)
-
     # Addresses whose function/global received a visible inference
     applied_addresses: set[int] = Field(default_factory=set)
 
@@ -51,8 +48,6 @@ class Model(BaseModel):
         "sections_uploaded_revision": "zenyard.sections_revision",
         "auto_apply": "zenyard.auto_apply",
         "function_original_annotations": "zenyard.function_original_annotations",
-        "swift_inferences": "zenyard.swift_inferences",
-        "not_swift_inferences": "zenyard.not_swift_inferences",
         "applied_addresses": "zenyard.applied_addresses",
     }
 
@@ -60,8 +55,6 @@ class Model(BaseModel):
     def _serialize(name: str, value: Any) -> Any:
         if name == "binary_id":
             return str(value)
-        if name in ("swift_inferences", "not_swift_inferences"):
-            return {str(k): v for k, v in value.items()}
         if name == "applied_addresses":
             return sorted(value)
         return value
@@ -70,8 +63,6 @@ class Model(BaseModel):
     def _deserialize(name: str, raw: Any) -> Any:
         if name == "binary_id":
             return UUID(str(raw))
-        if name in ("swift_inferences", "not_swift_inferences"):
-            return {int(k): v for k, v in raw.items()}
         if name == "applied_addresses":
             return {int(x) for x in raw}
         return raw
@@ -103,9 +94,9 @@ class Model(BaseModel):
         """Record addresses that just had a visible inference applied.
 
         Persisted explicitly: an in-place ``set.update`` does not trip
-        ``__setattr__``, so we mirror ``set_swift_inference`` and write the
-        metadata here. The Symbols-sidebar overlay reads these (resolved to the
-        symbols' current names) to tint applied rows.
+        ``__setattr__``, so we write the metadata here directly. The
+        Symbols-sidebar overlay reads these (resolved to the symbols' current
+        names) to tint applied rows.
 
         Known limitation: addresses are never removed, so undoing an applied
         rename leaves the address here and the row stays tinted (resolved to the
@@ -125,24 +116,6 @@ class Model(BaseModel):
         """Lock-safe immutable snapshot for the overlay paint controller."""
         with self._lock:
             return frozenset(self.applied_addresses)
-
-    def set_swift_inference(self, addr: int, payload: dict) -> None:
-        with self._lock:
-            self.swift_inferences[addr] = payload
-            self.bv.store_metadata(
-                self._PERSISTED_KEYS["swift_inferences"],
-                self._serialize("swift_inferences", self.swift_inferences),
-            )
-
-    def set_not_swift_inference(self, addr: int, payload: dict) -> None:
-        with self._lock:
-            self.not_swift_inferences[addr] = payload
-            self.bv.store_metadata(
-                self._PERSISTED_KEYS["not_swift_inferences"],
-                self._serialize(
-                    "not_swift_inferences", self.not_swift_inferences
-                ),
-            )
 
     def uploaded_hash_snapshot(self) -> dict[int, bytes]:
         """Lock-safe copy of the per-object content hashes already uploaded.

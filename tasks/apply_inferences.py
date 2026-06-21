@@ -6,7 +6,7 @@ import threading
 from binaryninja import (  # type: ignore[import]
     BinaryView,
 )
-from binaryninja.log import Logger
+from binaryninja.log import Logger  # type: ignore[import]
 
 from ..helpers.apply_inferences import apply_inferences
 from ..helpers.inference_types import InferenceItem

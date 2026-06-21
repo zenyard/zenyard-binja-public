@@ -6,7 +6,7 @@ import threading
 import typing as ty
 
 from binaryninja import execute_on_main_thread_and_wait  # type: ignore[import-not-found]
-from binaryninja.log import Logger
+from binaryninja.log import Logger  # type: ignore[import]
 from hypercorn.asyncio import serve  # type: ignore[import-untyped]
 from hypercorn.config import Config as HypercornConfig  # type: ignore[import-untyped]
 from mcp.server.fastmcp import FastMCP  # type: ignore[import-untyped]

@@ -19,7 +19,7 @@ import typing as ty
 from pathlib import Path
 from uuid import UUID
 
-from binaryninja.log import Logger
+from binaryninja.log import Logger  # type: ignore[import]
 
 from ..helpers.log import bind_logger, log_debug, log_error, log_info, log_warn
 import zenyard_relay

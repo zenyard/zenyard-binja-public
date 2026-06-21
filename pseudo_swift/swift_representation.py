@@ -23,6 +23,10 @@ from binaryninja import (  # type: ignore[import]
     OperatorPrecedence,
 )
 
+from .metadata_keys import (
+    NOT_SWIFT_FUNCTION_METADATA_KEY,
+    SWIFT_FUNCTION_METADATA_KEY,
+)
 from .swift_pygments import _tokenize_swift_line
 from ..zenyard_client.models import SwiftFunction
 from ..zenyard_client.models.line_mapping import LineMapping
@@ -71,18 +75,11 @@ def _build_body_source(source: str) -> str:
 def _load_swift_function_for(func: Function) -> SwiftFunction | None:
     """Look up the persisted SwiftFunction inference for ``func``, if any."""
     try:
-        raw = func.view.query_metadata("zenyard.swift_inferences")
-    except KeyError:
-        return None
+        entry = func.get_metadata(SWIFT_FUNCTION_METADATA_KEY)
     except Exception as e:
-        log_warn(
-            f"Pseudo Swift: query_metadata error for {hex(func.start)}: {e}"
-        )
+        log_warn(f"Pseudo Swift: get_metadata error for {hex(func.start)}: {e}")
         return None
-    if not raw or not isinstance(raw, dict):
-        return None
-    entry = raw.get(str(func.start))
-    if entry is None:
+    if not entry or not isinstance(entry, dict):
         return None
     swift_func = SwiftFunction.from_dict(entry)
     if swift_func is None:
@@ -96,18 +93,11 @@ def _load_swift_function_for(func: Function) -> SwiftFunction | None:
 def _load_not_swift_for(func: Function) -> NotSwift | None:
     """Look up the persisted NotSwift inference for ``func``, if any."""
     try:
-        raw = func.view.query_metadata("zenyard.not_swift_inferences")
-    except KeyError:
-        return None
+        entry = func.get_metadata(NOT_SWIFT_FUNCTION_METADATA_KEY)
     except Exception as e:
-        log_warn(
-            f"Pseudo Swift: query_metadata error for {hex(func.start)}: {e}"
-        )
+        log_warn(f"Pseudo Swift: get_metadata error for {hex(func.start)}: {e}")
         return None
-    if not raw or not isinstance(raw, dict):
-        return None
-    entry = raw.get(str(func.start))
-    if entry is None:
+    if not entry or not isinstance(entry, dict):
         return None
     not_swift = NotSwift.from_dict(entry)
     if not_swift is None:

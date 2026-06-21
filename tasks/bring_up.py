@@ -6,11 +6,11 @@ import pathlib
 import threading
 import typing as ty
 from uuid import UUID
-from binaryninja import (
+from binaryninja import (  # type: ignore[import]
     BinaryView,
     execute_on_main_thread_and_wait,
 )
-from binaryninja.log import Logger
+from binaryninja.log import Logger  # type: ignore[import]
 from ..configuration import get_preferences, save_show_initial_upload_message
 from ..api_client import LARGE_UPLOAD_TIMEOUT
 from ..helpers.retry import (
@@ -109,7 +109,7 @@ class BringUpTask(CancellableTask):
             max_retries=None,
             base_delay=_UPLOAD_BACKOFF_BASE,
             max_delay=_UPLOAD_BACKOFF_MAX,
-            stop=self._stop,
+            stop=self._stop_event,
             should_stop=self.is_cancelled,
             on_permanent=self._on_permanent_error,
             on_failure_count=lambda n: setattr(self, "connection_failures", n),

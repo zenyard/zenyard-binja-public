@@ -4,7 +4,7 @@ import queue
 import threading
 import typing as ty
 
-from binaryninja import (
+from binaryninja import (  # type: ignore[import]
     BackgroundTaskThread,
     BinaryView,
     execute_on_main_thread,
@@ -38,6 +38,7 @@ from ..helpers.sections import binary_mapped_size, is_dsc_view
 from ..mcp_server.endpoint import BinaryMcpEndpoint
 from ..mcp_server.ports import get_port_pool
 from ..model import Model
+from ..pseudo_swift.migration import maybe_migrate_swift_metadata
 from ..ui.dialogs import show_auth_error, show_size_limit_exceeded
 from ..zenyard_client import ApiClient, BinariesApi, UserApi
 from .classes import (
@@ -82,7 +83,7 @@ class Coordinator(BackgroundTaskThread):
         self._size_blocked = False
         self._auth_blocked = False
         self._stale_binary = False
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._channel: queue.Queue[tuple[list[InferenceItem], int]] = (
             queue.Queue(maxsize=1)
         )
@@ -180,7 +181,7 @@ class Coordinator(BackgroundTaskThread):
         )
 
     def request_shutdown(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self._actions.put(_ShutdownSentinel)
         log_debug(f"request shutdown {self._bv._file.filename}")
 
@@ -206,7 +207,7 @@ class Coordinator(BackgroundTaskThread):
 
             if not self._size_blocked and not self._is_dyld:
                 self._run_bring_up()
-            if self._stop.is_set():
+            if self._stop_event.is_set():
                 return
 
             # Registration may not have happened
@@ -219,7 +220,7 @@ class Coordinator(BackgroundTaskThread):
                     "Coordinator: binary not registered; hosting MCP+relay only"
                 )
 
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 try:
                     action = self._actions.get(timeout=0.5)
                 except queue.Empty:
@@ -244,7 +245,7 @@ class Coordinator(BackgroundTaskThread):
         if ensure_setup():
             return True
         log_debug("Coordinator: setup incomplete — awaiting analyze to retry")
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 action = self._actions.get(timeout=0.5)
             except queue.Empty:
@@ -314,7 +315,7 @@ class Coordinator(BackgroundTaskThread):
 
         # Stay alive while the file is open — even when unregistered — so
         # the MCP server and relay remain available.
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 action = self._actions.get(timeout=0.5)
             except queue.Empty:
@@ -333,7 +334,7 @@ class Coordinator(BackgroundTaskThread):
             bv=self._bv,
             model=self._model,
             channel=self._channel,
-            stop=self._stop,
+            stop=self._stop_event,
             logger=self._logger,
         )
         self._apply.start()
@@ -341,7 +342,7 @@ class Coordinator(BackgroundTaskThread):
             api=self._api,
             model=self._model,
             channel=self._channel,
-            stop=self._stop,
+            stop=self._stop_event,
             logger=self._logger,
             on_permanent_error=self._on_permanent_error,
         )
@@ -372,7 +373,7 @@ class Coordinator(BackgroundTaskThread):
             bv=self._bv,
             api=self._api,
             model=self._model,
-            stop=self._stop,
+            stop=self._stop_event,
             prompt_intro=prompt_intro,
             logger=self._logger,
             on_permanent_error=self._on_permanent_error,
@@ -410,7 +411,7 @@ class Coordinator(BackgroundTaskThread):
             # The Create-Revision click is itself the user's intent — don't
             # re-show the intro prompt on this unregistered re-run.
             self._run_bring_up(prompt_intro=False)
-            if self._stop.is_set() or self._model.binary_id is None:
+            if self._stop_event.is_set() or self._model.binary_id is None:
                 return
             self._mcp.set_binary_id(self._model.binary_id)
             self._enter_steady_state()
@@ -432,7 +433,7 @@ class Coordinator(BackgroundTaskThread):
         log_debug("check_inferences: draining download…")
         self._download.request_drain()
         self._download.wait_idle()
-        if self._stop.is_set():
+        if self._stop_event.is_set():
             return
         log_info("check_inferences: applying results")
         self._download.set_target(
@@ -474,6 +475,10 @@ def on_bv_created(bv: BinaryView) -> None:
             return
         coord = Coordinator(bv)
         _coordinators[name] = coord
+    try:
+        maybe_migrate_swift_metadata(bv)
+    except Exception as e:
+        log_warn(f"Zenyard: Swift metadata migration failed: {e}")
     coord.start()
 
 

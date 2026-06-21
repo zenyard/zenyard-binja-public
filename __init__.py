@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # Register pywin32 stand-ins before any `import mcp` (see module docstring).
 from . import _pywin32_shim  # noqa: F401
-from binaryninja import BinaryViewEvent, BinaryViewEventType
+from binaryninja import BinaryViewEvent, BinaryViewEventType  # type: ignore[import]
 from .plugin import on_bv_created
 from .ui import menu  # noqa: F401
 from .pseudo_swift.swift_representation import (
