@@ -40,6 +40,6 @@
          "zenyard-relay>=0.1.2"
      ]
    },
-   "version": "0.1.14",
+   "version": "0.1.16",
    "minimumbinaryninjaversion": 3164
 }
