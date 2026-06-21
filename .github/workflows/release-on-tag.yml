@@ -1,0 +1,34 @@
+# Cut a GitHub Release whenever an X.Y.Z tag is pushed here.
+#
+# zenyard-binja's release pipeline (publish-public job) mirrors the flattened
+# plugin into this repo and pushes a version tag over the CI_BOT_DEPLOY_PK SSH
+# deploy key. A deploy-key push triggers workflows (a built-in GITHUB_TOKEN push
+# would not), so this workflow fires and turns the tag into a GitHub Release
+# using this repo's own GITHUB_TOKEN — no cross-repo credential needed.
+#
+# The Release is the artifact the plugins-repo registry consumes: its
+# generate_index.py reads /releases/latest for auto_update plugins and errors on
+# a tag with no associated Release.
+name: Release on tag
+
+on:
+  push:
+    tags: ["[0-9]*.[0-9]*.[0-9]*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --verify-tag
