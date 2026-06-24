@@ -9,7 +9,12 @@ from dataclasses import dataclass
 
 from binaryninja.log import Logger  # type: ignore[import]
 
-from ..helpers.inference_types import InferenceItem
+from ..helpers.inference_types import (
+    END_OF_STREAM,
+    ChannelItem,
+    InferenceItem,
+    InferencePage,
+)
 from ..helpers.log import (
     log_debug,
     log_error,
@@ -28,16 +33,9 @@ from ..zenyard_client.models import BinaryStateQueued, Inference
 from .base import LongLivedTask, TaskCancelled
 
 _STATUS_POLL_INITIAL = 3.0
-_STATUS_POLL_MAX = 60.0
+_STATUS_POLL_MAX = 10.0
 _ERROR_BACKOFF_BASE = 2.0
 _ERROR_BACKOFF_MAX = 60.0
-
-
-# def _concise_error(e: Exception) -> str:
-#     if isinstance(e, ApiException):
-#         return f"HTTP {e.status} {e.reason}"
-#     flattened = " ".join(str(e).split())
-#     return f"{type(e).__name__}: {flattened}" if flattened else type(e).__name__
 
 
 @dataclass(frozen=True)
@@ -53,7 +51,7 @@ class DownloadInferencesTask(LongLivedTask):
         *,
         api: BinariesApi,
         model: Model,
-        channel: "queue.Queue[tuple[list[InferenceItem], int]]",
+        channel: "queue.Queue[ChannelItem]",
         stop: threading.Event,
         logger: Logger | None = None,
         on_permanent_error: ty.Callable[[Disposition], None] | None = None,
@@ -62,28 +60,15 @@ class DownloadInferencesTask(LongLivedTask):
         self._api = api
         self._model = model
         self._channel = channel
-        # Notified (with the Disposition) when a cycle stops on a permanent,
-        # non-transient error so the Coordinator can disable/surface it
-        # (auth → dialog, stale → status). Wired via ``_cycle_policy``.
         self._on_permanent_error = on_permanent_error
         self._drain = threading.Event()
         self._max_server_revision: int | None = None
         self.downloaded = 0
         self.waiting = False
         self.analysis_ready = False
-        # Server-side analysis progress, read GIL-atomically by the status bar
-        # (Coordinator.progress_snapshot) to fill the "Analyzing on server" bar.
-        # ``server_revision / target_revision`` is the same ratio the poll loop
-        # uses to decide completion, so the bar hits 100% exactly when ready.
         self.server_revision: float = 0.0
         self.target_revision: int = 0
-        # Queue position while the server holds the binary in its analysis
-        # queue (``BinaryStateQueued``); None once analysis runs. Read
-        # GIL-atomically by the status bar, like ``server_revision``.
         self.queue_position: int | None = None
-        # Consecutive transient API failures in the current cycle; reset on
-        # every success. Read GIL-atomically by the status bar to surface
-        # "Reconnecting…" once an outage outlives a short grace.
         self.consecutive_failures = 0
 
     # ── Public signal-in ──────────────────────────────────────────────────────
@@ -148,33 +133,29 @@ class DownloadInferencesTask(LongLivedTask):
             return
 
         cursor = target.start_cursor
+        # The loop terminates on the normal "stream finished" exit (``done``),
+        # or breaks early on drain/cancel/permanent error. ``_signal_stream_end``
+        # then runs once for every exit — telling the apply task to settle and
+        # release the analysis hold — except a hard cancel, which it skips.
         while not self.is_cancelled() and not self._drain.is_set():
             page = self._fetch_page(target.target_revision, cursor)
             if page is None:
-                return
+                break
             items, next_cursor, done = page
-            # Every page travels with its end cursor — even empty ones — so
-            # ApplyInferencesTask can persist the cursor once the page is
-            # applied. A close mid-flight then replays instead of skipping.
             if not self._put_with_drain((items, next_cursor)):
-                return
+                break
             self.downloaded += len(items)
             if done:
                 log_info(
                     f"download cycle complete for revision {target.target_revision}"
                 )
-                return
+                break
             cursor = next_cursor
+        self._signal_stream_end()
 
     # ── Polling ───────────────────────────────────────────────────────────────
 
     def _poll_until_ready(self, target_revision: int) -> bool:
-        """Block until ``server_revision >= target_revision``.
-        Returns True if ready, False on cancel/drain or a non-transient
-        error. The status call runs through ``call_backend``, so transient
-        errors are retried forever with backoff — an outage can never make
-        this poll give up — while a drain/cancel or permanent disposition
-        ends it (``_GaveUp``)."""
         interval = _STATUS_POLL_INITIAL
         prev_progress: float | None = None
         prev_queue_position: int | None = None
@@ -250,11 +231,6 @@ class DownloadInferencesTask(LongLivedTask):
     def _fetch_page(
         self, target_revision: int, cursor: int | None
     ) -> tuple[list[InferenceItem], int, bool] | None:
-        """Fetch one page. Returns ``(items, next_cursor, done)`` where
-        ``next_cursor`` is the fresh server cursor and ``done`` is True iff
-        this is the terminal page. Returns None on cancel/drain or a
-        non-transient error (``_GaveUp`` from ``call_backend``); transient
-        errors are retried forever."""
         binary_id = self._model.binary_id
         assert binary_id is not None
 
@@ -295,7 +271,7 @@ class DownloadInferencesTask(LongLivedTask):
                     # Pure pacing — a drain still forwards the page (the
                     # cursor must travel); the put below drops it if drained.
                     self._sleep_or_interrupt(_STATUS_POLL_INITIAL)
-                log_info(
+                log_debug(
                     f"fetched {len(concrete)} inference(s),"
                     f" cursor {cursor} → {result.cursor}, has_next=True"
                 )
@@ -315,7 +291,7 @@ class DownloadInferencesTask(LongLivedTask):
             server_revision = self._server_revision_from(
                 status, target_revision
             )
-            log_info(
+            log_debug(
                 f"fetched {len(concrete)} inference(s),"
                 f" cursor {cursor} → {result.cursor}, has_next=False,"
                 f" server_revision={server_revision:.3f}"
@@ -384,7 +360,7 @@ class DownloadInferencesTask(LongLivedTask):
 
     # ── Channel put with cooperative drain ────────────────────────────────────
 
-    def _put_with_drain(self, page: tuple[list[InferenceItem], int]) -> bool:
+    def _put_with_drain(self, page: InferencePage) -> bool:
         """Put ``page`` on the channel, polling cancel/drain while blocked.
         Returns True on success, False if interrupted by cancel/drain."""
         while True:
@@ -394,5 +370,17 @@ class DownloadInferencesTask(LongLivedTask):
             try:
                 self._channel.put(page, timeout=0.5)
                 return True
+            except queue.Full:
+                continue
+
+    def _signal_stream_end(self) -> None:
+        """Mark this cycle done producing so the apply task settles + releases
+        the analysis hold. Skipped on a hard cancel (apply releases on its own
+        teardown); drain-bypassing — unlike pages, the marker must still get
+        through so the consumer doesn't keep the hold across a re-target."""
+        while not self.is_cancelled():
+            try:
+                self._channel.put(END_OF_STREAM, timeout=0.5)
+                return
             except queue.Full:
                 continue

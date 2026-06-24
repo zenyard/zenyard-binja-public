@@ -9,8 +9,6 @@ from .settings_dialog import show_settings_dialog
 
 SETTING_ACTION = "Zenyard Settings"
 OPEN_AGENT_ACTION = "Zenyard Agent"
-CREATE_REVISION_ACTION = "CreateRevision"
-CHECK_INFERENCES_ACTION = "CheckInferences"
 GOTO_ZENYARD_SWIFT = "Jump to Zenyard Swift"
 
 prev_view = None

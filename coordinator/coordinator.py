@@ -19,7 +19,7 @@ from ..configuration import (
     save_max_binary_size_mb,
 )
 from ..helpers.analytics import track_file_open
-from ..helpers.inference_types import InferenceItem
+from ..helpers.inference_types import ChannelItem
 from ..helpers.log import (
     bind_logger,
     log_debug,
@@ -27,7 +27,6 @@ from ..helpers.log import (
     log_request_error,
     log_warn,
 )
-from ..helpers.misc import canonical_db_name, get_coordinator_name
 from ..helpers.retry import (
     Disposition,
     RetryPolicy,
@@ -37,7 +36,7 @@ from ..helpers.retry import (
 from ..helpers.sections import binary_mapped_size, is_dsc_view
 from ..mcp_server.endpoint import BinaryMcpEndpoint
 from ..mcp_server.ports import get_port_pool
-from ..model import Model
+from ..model import Model, read_session_key
 from ..pseudo_swift.migration import maybe_migrate_swift_metadata
 from ..ui.dialogs import show_auth_error, show_size_limit_exceeded
 from ..zenyard_client import ApiClient, BinariesApi, UserApi
@@ -84,9 +83,7 @@ class Coordinator(BackgroundTaskThread):
         self._auth_blocked = False
         self._stale_binary = False
         self._stop_event = threading.Event()
-        self._channel: queue.Queue[tuple[list[InferenceItem], int]] = (
-            queue.Queue(maxsize=1)
-        )
+        self._channel: queue.Queue[ChannelItem] = queue.Queue(maxsize=1)
         self._download: DownloadInferencesTask | None = None
         self._apply: ApplyInferencesTask | None = None
         self._current_bring_up: BringUpTask | None = None
@@ -108,6 +105,11 @@ class Coordinator(BackgroundTaskThread):
 
     def first_revision_done(self) -> bool:
         return self._model.last_completed_revision > 0
+
+    @property
+    def session_key(self) -> str | None:
+        """The binary's persisted, path-independent registry identity."""
+        return self._model.session_key
 
     def agent_upstream_id(self) -> str | None:
         return self._mcp.upstream_id if self._mcp.relay_running else None
@@ -348,24 +350,18 @@ class Coordinator(BackgroundTaskThread):
         )
         self._download.start()
 
-        # Start polling whenever there's a completed revision. With auto-apply on we always poll
         if self.first_revision_done():
             auto_apply = self._model.auto_apply
-            just_uploaded = (
-                self._current_bring_up is not None
-                and self._current_bring_up.objects_uploaded > 0
+            self._download.set_target(
+                target_revision=self._model.last_completed_revision,
+                start_cursor=self._model.inference_cursor,
+                apply=auto_apply,
             )
-            if auto_apply or just_uploaded:
-                self._download.set_target(
-                    target_revision=self._model.last_completed_revision,
-                    start_cursor=self._model.inference_cursor,
-                    apply=auto_apply,
+            if not auto_apply:
+                log_info(
+                    "auto-apply off; polling for readiness — apply via"
+                    " 'Check Inferences' when ready"
                 )
-                if not auto_apply:
-                    log_info(
-                        "auto-apply off; polling for readiness — apply via"
-                        " 'Check Inferences' when ready"
-                    )
 
     def _run_bring_up(self, *, prompt_intro: bool = True) -> None:
         assert self._api is not None
@@ -462,19 +458,25 @@ _coordinators_lock = threading.Lock()
 
 
 def get_coordinator_for_bv(bv: BinaryView) -> Coordinator | None:
+    key = read_session_key(bv)
+    if key is None:
+        return None
     with _coordinators_lock:
-        return _coordinators.get(get_coordinator_name(bv))
+        return _coordinators.get(key)
 
 
 def on_bv_created(bv: BinaryView) -> None:
     if bv.view_type == "Raw":
         return
-    name = get_coordinator_name(bv)
     with _coordinators_lock:
-        if name in _coordinators:
+        key = read_session_key(bv)
+        if key is not None and key in _coordinators:
             return
         coord = Coordinator(bv)
-        _coordinators[name] = coord
+        key = coord.session_key
+        if key is None:
+            return
+        _coordinators[key] = coord
     try:
         maybe_migrate_swift_metadata(bv)
     except Exception as e:
@@ -482,13 +484,21 @@ def on_bv_created(bv: BinaryView) -> None:
     coord.start()
 
 
-def shutdown_coordinators_for_file(filename: str) -> None:
-    name = canonical_db_name(filename)
-    to_shutdown: list[Coordinator] = []
+def shutdown_coordinator_on_close(
+    bv: BinaryView | None, filename: str | None
+) -> None:
+    key = read_session_key(bv) if bv is not None else None
+    coord: Coordinator | None = None
     with _coordinators_lock:
-        coord = _coordinators.get(name, None)
-        if coord is not None:
-            del _coordinators[name]
-            to_shutdown.append(coord)
-    for coord in to_shutdown:
+        if key is not None:
+            coord = _coordinators.pop(key, None)
+        if coord is None and filename:
+            for k, c in list(_coordinators.items()):
+                try:
+                    if c._bv._file.filename == filename:
+                        coord = _coordinators.pop(k)
+                        break
+                except Exception:
+                    continue
+    if coord is not None:
         coord.request_shutdown()

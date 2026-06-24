@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import threading
 from typing import Any, ClassVar, Iterable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from binaryninja import BinaryView  # type: ignore[import]
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 # Sentinel placed on inference_queue to signal ApplyInferencesTask to exit.
 INFERENCE_DRAIN_SENTINEL = object()
+SESSION_KEY_META = "zenyard.session_key"
+
+
+def read_session_key(bv: BinaryView) -> str | None:
+    try:
+        raw = bv.query_metadata(SESSION_KEY_META)  # raises if absent
+    except Exception:
+        return None
+    return str(raw) if raw else None
 
 
 class Model(BaseModel):
@@ -23,6 +32,7 @@ class Model(BaseModel):
 
     bv: BinaryView
     status: str = "Zenyard: ready"
+    session_key: str | None = None
     binary_id: UUID | None = None
     last_submitted_revision: int = 0
     last_completed_revision: int = 0
@@ -41,6 +51,7 @@ class Model(BaseModel):
     _lock: threading.RLock = PrivateAttr(default_factory=threading.RLock)
 
     _PERSISTED_KEYS: ClassVar[dict[str, str]] = {
+        "session_key": SESSION_KEY_META,
         "binary_id": "zenyard.binary_id",
         "last_completed_revision": "zenyard.final_revision",
         "applied_count": "zenyard.applied_count",
@@ -143,4 +154,9 @@ class Model(BaseModel):
                     loaded[field_name] = cls._deserialize(field_name, raw)
             except Exception:
                 pass
-        return cls(bv=bv, **loaded)
+        model = cls(bv=bv, **loaded)
+        if model.session_key is None:
+            # Mint via the field setter so it persists through the same
+            # __setattr__ path as every other persisted field.
+            model.session_key = uuid4().hex
+        return model

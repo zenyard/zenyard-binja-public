@@ -114,10 +114,10 @@ class _BounceBar(QWidget):
         self.setFixedSize(_BAR_W, _BAR_H)
         self._bouncing = False
         self._pos = 0.0  # eased segment position, 0..1 (bounce mode)
-        self._pct = 0  # fill fraction, 0..100 (determinate mode)
+        self._pct: float = 0  # fill fraction, 0..100 (determinate mode)
         self._enabled_look = True  # False ⇒ paused/greyed chunk
 
-    def set_fill(self, pct: int, *, enabled: bool = True) -> None:
+    def set_fill(self, pct: float, *, enabled: bool = True) -> None:
         self._bouncing = False
         self._pct = max(0, min(100, pct))
         self._enabled_look = enabled
@@ -162,7 +162,7 @@ class _BounceBar(QWidget):
             p.drawRoundedRect(QRectF(x, 0, cw, h), r, r)
 
 
-def _is_determinate(state: str, pct: int | None) -> bool:
+def _is_determinate(state: str, pct: float | None) -> bool:
     """Fill (determinate) vs sweep for a bar state. `paused` is always a frozen
     fill; the active states fill once their percentage climbs above 0 and sweep
     until then — so `extracting` / `applying` (pct always None) always sweep."""
@@ -181,7 +181,7 @@ class ZenyardStatusWidget(QWidget):
         super().__init__(parent)
 
         self._state = "idle"
-        self._pct: int | None = None
+        self._pct: float | None = None
         self._counts: dict[str, int] = {}
         self._warning_count = 0
         self._pause_reason: str | None = None
@@ -230,8 +230,11 @@ class ZenyardStatusWidget(QWidget):
                 self._pct = None
             self._render()
 
-    def set_progress(self, pct: int) -> None:
-        self._pct = max(0, min(100, int(pct)))
+    def set_progress(self, pct: float) -> None:
+        # Keep the fraction (don't truncate to int): the `server` read-out shows
+        # one decimal — "Analyzing on server 99.9%" — so a near-target revision
+        # never reads as a misleading "100%".
+        self._pct = max(0.0, min(100.0, pct))
         state = self._effective_state()
         if state == "server":
             # The live % rides the label suffix as well as the bar. Update just

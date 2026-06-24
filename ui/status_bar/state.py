@@ -28,6 +28,7 @@ from a hang.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # The canonical states. Exposed so the widget and tests share one spelling.
@@ -122,7 +123,9 @@ def usage_text(usage: UsageInfo | None) -> str:
         return "—"
     if usage.kind == "unlimited":
         return "∞"
-    return f"{usage.percent or 0}%"
+    # Display caps at 100% even when over budget (the raw ``percent`` keeps its
+    # >100 value for ``usage_tone``/``quota_blocks``).
+    return f"{min(100, usage.percent or 0)}%"
 
 
 def usage_tone(usage: UsageInfo | None) -> str:
@@ -152,7 +155,7 @@ class ViewState:
     """What the widget renders. A pure projection of a ``RunSnapshot``."""
 
     state: str
-    pct: int | None  # None ⇒ indeterminate / no percentage read-out
+    pct: float | None  # None ⇒ indeterminate / no percentage read-out
     counts: dict[str, int]
     title: str  # tooltip title row
     subtitle: str  # tooltip subtitle line
@@ -175,35 +178,23 @@ class MenuItem:
 _SEP = MenuItem(is_separator=True)
 
 
-def _pct_from(done: int, total: int) -> int:
+def _pct_from(done: int, total: int) -> float:
     if total <= 0:
-        return 0
-    return max(0, min(100, round(100 * done / total)))
+        return 0.0
+    return math.floor(1000 * done / total) / 10
 
 
-def _server_pct(server_revision: float, target_revision: int) -> int | None:
-    """Server-analysis percentage from the (float) revision level over the
-    target revision. ``None`` when no target is set yet (the brief window
-    before the first poll returns) — the driver then leaves the bar at its
-    current value rather than dividing by zero."""
-
+def _server_pct(server_revision: float, target_revision: int) -> float | None:
     if target_revision <= 0:
         return None
-    return max(0, min(100, round(100 * server_revision / target_revision)))
+
+    return math.floor(1000 * server_revision / target_revision) / 10
 
 
 def derive_view_state(
     snap: RunSnapshot, usage: UsageInfo | None = None
 ) -> ViewState:
-    """Select the active state and compute its display fields.
-
-    Selection is a strict cascade over what the run loop can observe today,
-    then ``usage`` (from the separate background poll) can override to
-    ``paused`` when the account is over budget / expired. ``extracting``,
-    ``warning`` and the *manual* ``paused`` are never produced here (the run
-    loop has no surface for them yet); the widget still renders them when the
-    host calls ``set_state`` directly.
-    """
+    """Select the active state and compute its display fields."""
 
     counts = {
         "uploaded": snap.objects_uploaded,
@@ -282,19 +273,13 @@ def derive_view_state(
 
 def tooltip_copy(
     state: str,
-    pct: int | None,
+    pct: float | None,
     counts: dict[str, int],
     applied_total: int = 0,
     warning_count: int = 0,
     pause_reason: str | None = None,
     usage: UsageInfo | None = None,
 ) -> tuple[str, str]:
-    """Per-state tooltip title + subtitle (design handoff §Interactions).
-
-    Works from the plain contract values so both ``derive_view_state`` and the
-    widget (which only has ``set_counts`` data) can produce identical copy.
-    """
-
     total = counts.get("total", 0)
     uploaded = counts.get("uploaded", 0)
     applied = applied_total or counts.get("applied", 0)
@@ -328,7 +313,7 @@ def tooltip_copy(
             # read-out; the bar stays a busy sweep.
             head = "Server preparing binary"
         elif pct is not None:
-            head = f"Analyzing on server · {pct}%"
+            head = f"Analyzing on server · {pct:.1f}%"
         else:
             head = "Analyzing on server"
         return (
@@ -381,7 +366,12 @@ def tooltip_copy(
                 "upgrade your plan.",
             )
         if pause_reason == "quota":
-            used = usage.percent if usage and usage.percent is not None else 0
+            # Display caps at 100% even when the account is over budget.
+            used = (
+                min(100, usage.percent)
+                if usage and usage.percent is not None
+                else 0
+            )
             return (
                 "Usage limit reached",
                 f"You've used {used}% of your monthly quota. Runs are paused "
@@ -423,29 +413,17 @@ STATE_LABEL: dict[str, tuple[str, str]] = {
 
 def state_label(
     state: str,
-    pct: int | None = None,
+    pct: float | None = None,
     warning_count: int = 0,
     queue_position: int | None = None,
 ) -> tuple[str, str]:
-    """Final (text, color-role) for the status label, dynamic suffixes folded in.
-
-    Kept Qt-free here (alongside the rest of the copy logic) so the suffixing is
-    unit-testable. The `server` state shows its progress as a label suffix —
-    "Analyzing on server… 79%" — because its bar runs the indeterminate busy
-    marquee and carries no value. At exactly 0% it reads "Server preparing
-    binary" instead (the server has reported no revision progress yet). The
-    `queued` state likewise rides its queue position — "In queue (5 remaining)".
-    """
-
     text, role = STATE_LABEL.get(state, ("Zenyard", "dim"))
     if state == "warning":
         text = text.format(n=warning_count)
     elif state == "server" and pct == 0:
-        # Exactly 0%: still preparing the binary (no revision progress yet).
-        # Drop the "0%" suffix; the bar keeps its busy sweep unchanged.
         text = "Server preparing binary"
     elif state == "server" and pct is not None:
-        text = f"{text} {pct}%"
+        text = f"{text} {pct:.1f}%"
     elif state == "queued" and queue_position is not None:
         text = f"{text} ({queue_position} remaining)"
     return text, role
