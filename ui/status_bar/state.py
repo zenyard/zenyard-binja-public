@@ -135,7 +135,7 @@ def usage_tone(usage: UsageInfo | None) -> str:
         return "dim"
     if usage.percent >= 100:
         return "crit"
-    if usage.percent >= 85:
+    if usage.percent >= 80:
         return "amber"
     return "dim"
 
